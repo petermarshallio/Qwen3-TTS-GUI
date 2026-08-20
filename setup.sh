@@ -139,6 +139,47 @@ if ! "$PYTHON_BIN" -c "import tkinter" >/dev/null 2>&1; then
   log "tkinter installed successfully."
 fi
 
+# The Python "sox" package (pulled in by qwen-tts) is just a wrapper around the
+# system sox binary — pip installing it doesn't install the binary itself. Not a
+# hard requirement for the GUI to start, so this warns rather than erroring out.
+install_system_package() {
+  local pkg="$1"
+  if [[ "$OS" == "Darwin" ]]; then
+    log "Attempting: brew install $pkg"
+    brew install "$pkg" || true
+  elif command -v apt-get >/dev/null 2>&1; then
+    log "Attempting: sudo apt-get install -y $pkg"
+    sudo apt-get install -y "$pkg" || true
+  elif command -v dnf >/dev/null 2>&1; then
+    log "Attempting: sudo dnf install -y $pkg"
+    sudo dnf install -y "$pkg" || true
+  elif command -v yum >/dev/null 2>&1; then
+    log "Attempting: sudo yum install -y $pkg"
+    sudo yum install -y "$pkg" || true
+  elif command -v pacman >/dev/null 2>&1; then
+    log "Attempting: sudo pacman -S --noconfirm $pkg"
+    sudo pacman -S --noconfirm "$pkg" || true
+  elif command -v zypper >/dev/null 2>&1; then
+    log "Attempting: sudo zypper install -y $pkg"
+    sudo zypper install -y "$pkg" || true
+  elif command -v apk >/dev/null 2>&1; then
+    log "Attempting: sudo apk add $pkg"
+    sudo apk add "$pkg" || true
+  else
+    log "No supported package manager found for an automatic install."
+  fi
+}
+
+if ! command -v sox >/dev/null 2>&1; then
+  log "sox (system binary) not found — attempting to install it automatically ..."
+  install_system_package sox
+  if command -v sox >/dev/null 2>&1; then
+    log "sox installed successfully."
+  else
+    log "Warning: sox is still not available. Install it manually if you hit audio-processing errors (e.g. brew install sox)."
+  fi
+fi
+
 if [[ -d .venv ]]; then
   EXISTING_VER="$(.venv/bin/python -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || echo "")"
   if [[ "$EXISTING_VER" != "$PYTHON_VER" ]]; then
