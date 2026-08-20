@@ -107,7 +107,7 @@ def list_voice_recordings(voice_name):
     )
 
 
-VOICE_MARKER_RE = re.compile(r"\[([^\[\]]+)\]")
+VOICE_MARKER_RE = re.compile(r"\[([^\[\]:]+)(?::([^\[\]]*))?\]")
 
 
 def build_voice_lookup():
@@ -121,34 +121,62 @@ def build_voice_lookup():
     return lookup
 
 
-def parse_voice_segments(text, default_voice, lookup):
-    """Split `text` on [VoiceName] markers into ordered (kind, key, segment_text)
-    tuples. Text before the first marker uses `default_voice`; each marker sets the
-    active voice for everything after it until the next marker. Empty segments are
-    dropped. Returns (segments, unresolved) where `unresolved` lists marker names (as
-    typed) that didn't match a known voice in `lookup`."""
+def parse_voice_segments(text, lookup):
+    """Split `text` on `[VoiceName]` / `[VoiceName:instruction]` markers into ordered
+    (kind, key, segment_text, instruct) tuples. Each marker sets the active voice (and
+    instruction, if given) for everything after it until the next marker. Empty
+    segments are dropped.
+
+    Text isn't allowed before the first marker — with no dropdown fallback, there's no
+    voice to assign it to.
+
+    Returns:
+        (segments, errors, warnings). `errors` block generation (unknown voice names,
+        text with no voice assigned) — join and show, don't generate. `warnings` don't
+        (an instruction given for a voice-clone voice, which has no instruct concept
+        and will just be ignored) — show, then generate anyway.
+    """
     segments = []
-    unresolved = []
-    voice = default_voice
+    errors = []
+    warnings = []
+    voice = None
+    instruct = ""
     pos = 0
     for match in VOICE_MARKER_RE.finditer(text):
         chunk = text[pos : match.start()].strip()
         if chunk:
-            segments.append((voice[0], voice[1], chunk))
+            if voice is None:
+                errors.append(
+                    f'Text before the first [Voice] marker has no voice assigned: "{chunk}"'
+                )
+            else:
+                segments.append((voice[0], voice[1], chunk, instruct))
 
-        name = match.group(1)
-        resolved = lookup.get(name.strip().lower())
+        name = match.group(1).strip()
+        marker_instruct = (match.group(2) or "").strip()
+        resolved = lookup.get(name.lower())
         if resolved is None:
-            unresolved.append(name)
+            errors.append(f"Unknown voice: [{name}]")
         else:
             voice = resolved
+            instruct = marker_instruct
+            if instruct and voice[0] == "custom":
+                warnings.append(
+                    f'"{name}" is a voice clone — instructions only work with preset '
+                    f"voices, so [{name}:{marker_instruct}] will be generated without one."
+                )
         pos = match.end()
 
     chunk = text[pos:].strip()
     if chunk:
-        segments.append((voice[0], voice[1], chunk))
+        if voice is None:
+            errors.append(
+                f'Text before the first [Voice] marker has no voice assigned: "{chunk}"'
+            )
+        else:
+            segments.append((voice[0], voice[1], chunk, instruct))
 
-    return segments, unresolved
+    return segments, errors, warnings
 
 
 def _is_cuda_compat_error(exc):
@@ -306,10 +334,11 @@ class QwenTTSGUI:
 
     def setup_voice_autocomplete(self, text_widget):
         """Bind `text_widget` so typing '[' opens a filtered voice-name popup.
-        Enter/Tab/click on a match inserts 'Name]' and closes it. Escape, clicking
-        elsewhere, losing focus, or confirming with no match selected are all
-        *abandoned* closes — they erase the dangling '[' + partial name so it
-        doesn't linger as noise. Typing ']' by hand is a deliberate, complete marker
+        Enter/Tab/click on a match inserts 'Name]' — cursor landing just before the
+        ']' so an optional ':instruction' can follow — and closes the popup. Escape,
+        clicking elsewhere, losing focus, or confirming with no match selected are all
+        *abandoned* closes — they erase the dangling '[' + partial name so it doesn't
+        linger as noise. Typing ']' or ':' by hand means the marker (or its name) was
         typed without the popup's help, so that text is left exactly as typed."""
         state = {"popup": None, "listbox": None, "names": []}
         MARK = "voice_ac_start"
@@ -352,6 +381,9 @@ class QwenTTSGUI:
             name = listbox.get(listbox.curselection()[0])
             text_widget.delete(f"{MARK}+1c", "insert")
             text_widget.insert("insert", f"{name}]")
+            # Land the cursor between the name and ']', so an optional ":instruction"
+            # can be typed right away without deleting/retyping the closing bracket.
+            text_widget.mark_set("insert", "insert - 1c")
             close_popup()
 
         def move_selection(delta):
@@ -415,8 +447,9 @@ class QwenTTSGUI:
                 # press, undoing the move_selection() that just ran.
                 return
             filter_text = current_filter()
-            if "]" in filter_text:
-                # Typed a complete marker by hand — leave it as-is.
+            if "]" in filter_text or ":" in filter_text:
+                # Typed a complete marker, or moved on to typing ":instruction" by
+                # hand — leave it as-is either way.
                 close_popup()
                 return
             if "\n" in filter_text or text_widget.compare("insert", "<=", MARK):
@@ -489,9 +522,6 @@ class QwenTTSGUI:
 
         self._set_frame_enabled(self.use_frame, not busy)
         self.generate_button.config(text="Generating..." if busy else "Generate Speech")
-        if not busy:
-            # Instruction box's visibility depends on whether a preset is selected.
-            self.on_use_voice_selected()
 
     def show_success_with_link(self, title, message, file_path):
         """Success dialog with a clickable link that reveals the generated file."""
@@ -704,10 +734,11 @@ class QwenTTSGUI:
             self.recording_combo.config(state="disabled")
 
     def refresh_voice_lists(self):
-        """Repopulate both tabs' voice pickers — called after a voice is (re-)trained
-        so it shows up immediately without restarting the app."""
+        """Repopulate the Train tab's voice picker — called after a voice is
+        (re-)trained so it shows up immediately without restarting the app. The Use
+        tab has no voice picker of its own: voices are resolved live from
+        `build_voice_lookup()` when [VoiceName] markers are parsed at generate time."""
         self.refresh_train_voice_list()
-        self.refresh_use_voice_list()
 
     def setup_use_tab(self):
         title_label = ttk.Label(
@@ -717,52 +748,21 @@ class QwenTTSGUI:
         )
         title_label.pack(pady=10)
 
-        # Voice selection: custom voices from the local cache + read-only presets
-        voice_frame = ttk.LabelFrame(self.use_frame, text="Voice Selection", padding=10)
-        voice_frame.pack(fill=tk.X, padx=20, pady=10)
-
-        voice_select_frame = ttk.Frame(voice_frame)
-        voice_select_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(voice_select_frame, text="Voice:").pack(side=tk.LEFT, padx=5)
-        self.use_voice_combo = ttk.Combobox(
-            voice_select_frame, width=37, state="readonly"
-        )
-        self.use_voice_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        self.use_voice_combo.bind(
-            "<<ComboboxSelected>>", lambda e: self.on_use_voice_selected()
-        )
-
-        language_frame = ttk.Frame(voice_frame)
-        language_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(language_frame, text="Language:").pack(side=tk.LEFT, padx=5)
+        language_frame = ttk.LabelFrame(self.use_frame, text="Language", padding=10)
+        language_frame.pack(fill=tk.X, padx=20, pady=10)
         self.use_language_combo = ttk.Combobox(
             language_frame, width=37, state="readonly", values=SUPPORTED_LANGUAGES
         )
         self.use_language_combo.set("Auto")
         self.use_language_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
 
-        # Instruction — only meaningful for preset voices (generate_voice_clone has no
-        # instruct parameter at all). Stays visible for both, greyed out and explained
-        # rather than hidden for custom voices — see on_use_voice_selected.
-        self.instruct_frame = ttk.Frame(voice_frame)
-        self.instruct_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(self.instruct_frame, text="Instruction:").pack(side=tk.LEFT, padx=5)
-        self.instruct_entry = ttk.Entry(self.instruct_frame, width=37)
-        self.instruct_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        self.add_placeholder_entry(self.instruct_entry, "e.g. say it in an angry tone")
-        # add_placeholder_entry's own FocusOut always restores the placeholder text it
-        # was given above; re-run afterwards so the hint matches the current voice kind.
-        self.instruct_entry.bind(
-            "<FocusOut>", lambda e: self.on_use_voice_selected(), add="+"
-        )
-
         text_frame = ttk.LabelFrame(self.use_frame, text="Text to Generate", padding=10)
         text_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
 
         ttk.Label(
             text_frame,
-            text="Tip: type [VoiceName] to switch voices from that "
-            "point on — try typing '['.",
+            text="Every generation starts with a [VoiceName] or "
+            "[VoiceName:instruction] marker — try typing '['.",
             foreground="gray",
         ).pack(anchor=tk.W, pady=(0, 5))
 
@@ -790,22 +790,15 @@ class QwenTTSGUI:
             format_frame, text="M4A", variable=self.output_format, value="m4a"
         ).pack(side=tk.LEFT, padx=10)
 
-        save_frame = ttk.Frame(self.use_frame)
-        save_frame.pack(fill=tk.X, padx=20, pady=10)
-        ttk.Label(save_frame, text="Save Location:").pack(side=tk.LEFT, padx=5)
-        self.use_save_entry = ttk.Entry(save_frame, width=40)
-        self.use_save_entry.insert(0, OUTPUT_DIR)
-        self.use_save_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ttk.Button(
-            save_frame, text="Browse", command=self.browse_save_location_use
-        ).pack(side=tk.LEFT, padx=5)
-
         self.use_status_label = ttk.Label(self.use_frame, text="", foreground="blue")
         self.use_status_label.pack(pady=10)
 
         self.use_progress = ttk.Progressbar(self.use_frame, mode="indeterminate")
         # Not packed here — shown only while generation is in progress (set_use_busy).
 
+        # Generate opens a native Save As dialog (pre-filled with a dated default
+        # filename) before starting, rather than writing to a persistent folder path.
+        self.last_save_dir = OUTPUT_DIR
         self.generate_button = ttk.Button(
             self.use_frame,
             text="Generate Speech",
@@ -813,9 +806,6 @@ class QwenTTSGUI:
             style="Accent.TButton",
         )
         self.generate_button.pack(pady=20)
-
-        self.use_voice_map = {}
-        self.refresh_use_voice_list()
 
     def setup_configure_tab(self):
         """Settings shared across tabs — currently just the device — rather than
@@ -848,47 +838,6 @@ class QwenTTSGUI:
                 foreground="gray",
             ).pack(side=tk.LEFT, padx=10)
 
-    def refresh_use_voice_list(self):
-        """Repopulate the Use tab's voice picker with local custom voices + presets."""
-        current = self.use_voice_combo.get()
-        self.use_voice_map = {}
-        values = []
-        for name in list_custom_voices():
-            self.use_voice_map[name] = ("custom", name)
-            values.append(name)
-        for speaker in PRESET_VOICES:
-            label = f"{speaker} (Preset)"
-            self.use_voice_map[label] = ("preset", speaker)
-            values.append(label)
-
-        self.use_voice_combo["values"] = values
-        if current in self.use_voice_map:
-            self.use_voice_combo.set(current)
-        elif values:
-            self.use_voice_combo.set(values[0])
-        else:
-            self.use_voice_combo.set("")
-        self.on_use_voice_selected()
-
-    def on_use_voice_selected(self):
-        """Instruction only does anything for preset voices (generate_voice_clone has no
-        instruct parameter at all). Stays editable even when the default voice is a
-        custom voice, since a [PresetName] marker later in the text may still need one
-        — only the placeholder hint text changes, and only while empty."""
-        kind, _ = self.use_voice_map.get(self.use_voice_combo.get(), (None, None))
-        entry = self.instruct_entry
-        entry.config(state=tk.NORMAL)
-
-        hint = (
-            "e.g. say it in an angry tone"
-            if kind == "preset"
-            else "Only applies to preset voices, incl. any [VoiceName] segments."
-        )
-        if getattr(entry, "showing_placeholder", False):
-            entry.delete(0, tk.END)
-            entry.insert(0, hint)
-            entry.config(foreground="grey")
-
     def browse_audio_file(self):
         filename = filedialog.askopenfilename(
             title="Select Audio File",
@@ -897,15 +846,6 @@ class QwenTTSGUI:
         if filename:
             self.audio_file_entry.delete(0, tk.END)
             self.audio_file_entry.insert(0, filename)
-
-    def browse_save_location_use(self):
-        """Browse for save folder when generating speech"""
-        folder = filedialog.askdirectory(
-            title="Select Folder to Save Generated Speech", initialdir=OUTPUT_DIR
-        )
-        if folder:
-            self.use_save_entry.delete(0, tk.END)
-            self.use_save_entry.insert(0, folder)
 
     def toggle_recording(self):
         if not self.recording:
@@ -1236,46 +1176,61 @@ class QwenTTSGUI:
             self.root.after(0, lambda: self.set_train_busy(False))
 
     def generate_speech(self):
-        """Parse [VoiceName] markers, validate them, and kick off `_generate_speech_thread`."""
+        """Parse [VoiceName] markers, resolve a save path, and kick off
+        `_generate_speech_thread`."""
         text = self.get_text_value(self.text_entry)
         output_format = self.output_format.get()
         language = self.use_language_combo.get()
-        instruct = self.get_entry_value(self.instruct_entry)
-
-        selected = self.use_voice_combo.get()
-        default_voice = self.use_voice_map.get(selected)
-        if not default_voice:
-            messagebox.showerror("Error", "Please select a voice")
-            return
 
         if not text:
             messagebox.showerror("Error", "Please enter text to generate")
             return
 
-        segments, unresolved = parse_voice_segments(
-            text, default_voice, build_voice_lookup()
-        )
-        if unresolved:
-            names = ", ".join(f"[{name}]" for name in unresolved)
-            messagebox.showerror(
-                "Unknown Voice",
-                f"Unknown voice(s) in the text: {names}\n\n"
-                "Check spelling against the Voice dropdown / your trained voices.",
-            )
+        segments, errors, warnings = parse_voice_segments(text, build_voice_lookup())
+        if errors:
+            messagebox.showerror("Error", "\n\n".join(errors))
             return
-
         if not segments:
             messagebox.showerror("Error", "Please enter text to generate")
+            return
+        if warnings:
+            messagebox.showwarning("Note", "\n\n".join(warnings))
+
+        output_file = self._ask_save_path(segments, output_format)
+        if not output_file:
             return
 
         self.set_use_busy(True)
 
         thread = threading.Thread(
             target=self._generate_speech_thread,
-            args=(segments, output_format, language, instruct),
+            args=(segments, output_format, language, output_file),
         )
         thread.daemon = True
         thread.start()
+
+    def _ask_save_path(self, segments, output_format):
+        """Native Save As dialog, defaulting to a dated filename and the last folder
+        used this session. Returns the chosen path, or "" if the user cancelled."""
+        distinct_voices = {(kind, key) for kind, key, _, _ in segments}
+        if len(distinct_voices) == 1:
+            _, key = next(iter(distinct_voices))
+            filename_stub = f"{key}_output"
+        else:
+            filename_stub = "multivoice_output"
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        default_filename = f"{filename_stub}_{timestamp}.{output_format}"
+
+        output_file = filedialog.asksaveasfilename(
+            title="Save Generated Speech",
+            initialdir=self.last_save_dir,
+            initialfile=default_filename,
+            defaultextension=f".{output_format}",
+            filetypes=[(output_format.upper(), f"*.{output_format}")],
+        )
+        if output_file:
+            self.last_save_dir = os.path.dirname(output_file)
+        return output_file
 
     def _load_voice_clone_prompt(self, key, device_type):
         """Load a trained custom voice's VoiceClonePromptItem.
@@ -1338,7 +1293,7 @@ class QwenTTSGUI:
         return prompt_items[0]
 
     def _generate_speech_thread(
-        self, segments, output_format="wav", language="Auto", instruct=""
+        self, segments, output_format="wav", language="Auto", output_file=""
     ):
         """Generate and stitch together speech for parsed [VoiceName] segments.
 
@@ -1347,17 +1302,19 @@ class QwenTTSGUI:
         single batched call, then reassembles the results in original text order.
 
         Args:
-            segments: Ordered (kind, key, text) tuples from `parse_voice_segments`.
+            segments: Ordered (kind, key, text, instruct) tuples from
+                `parse_voice_segments`. `instruct` is only meaningful for "preset"
+                segments — generate_voice_clone has no instruct concept.
             output_format: "wav", "mp3", or "m4a".
             language: One of SUPPORTED_LANGUAGES, applied to every segment.
-            instruct: Style instruction, applied only to "preset" segments.
+            output_file: Full path chosen via the Save As dialog in `generate_speech`.
         """
         try:
             device_type = self.device_type.get()
 
-            groups = {}  # kind -> list of (segment_index, key, text)
-            for i, (kind, key, seg_text) in enumerate(segments):
-                groups.setdefault(kind, []).append((i, key, seg_text))
+            groups = {}  # kind -> list of (segment_index, key, text, instruct)
+            for i, (kind, key, seg_text, instr) in enumerate(segments):
+                groups.setdefault(kind, []).append((i, key, seg_text, instr))
             kinds_needed = [k for k in ("custom", "preset") if groups.get(k)]
 
             wavs_by_index = {}
@@ -1375,7 +1332,7 @@ class QwenTTSGUI:
                 # Only worth naming the group/voices once there's more than one group —
                 # for the common single-voice case this stays exactly as it always was.
                 if total_groups > 1:
-                    distinct_keys = ", ".join(sorted({k for _, k, _ in group}))
+                    distinct_keys = ", ".join(sorted({k for _, k, _, _ in group}))
                     kind_label = "custom" if kind == "custom" else "preset"
                     phase = f" ({group_index + 1}/{total_groups}: {kind_label} — {distinct_keys})"
                 else:
@@ -1394,17 +1351,20 @@ class QwenTTSGUI:
                     status_label=self.use_status_label,
                 )
 
-                texts = [t for _, _, t in group]
+                texts = [t for _, _, t, _ in group]
 
                 if kind == "preset":
-                    speakers = [k for _, k, _ in group]
+                    speakers = [k for _, k, _, _ in group]
+                    instructs = [instr for _, _, _, instr in group]
 
-                    def do_generate(m, texts=texts, speakers=speakers):
+                    def do_generate(
+                        m, texts=texts, speakers=speakers, instructs=instructs
+                    ):
                         return m.generate_custom_voice(
                             text=texts,
                             speaker=speakers,
                             language=language,
-                            instruct=instruct or None,
+                            instruct=instructs,
                         )
                 else:
                     self.root.after(
@@ -1413,12 +1373,12 @@ class QwenTTSGUI:
                             text=f"Loading voice(s){p}...", foreground="blue"
                         ),
                     )
-                    for _, key, _ in group:
+                    for _, key, _, _ in group:
                         if key not in loaded_prompts:
                             loaded_prompts[key] = self._load_voice_clone_prompt(
                                 key, device_type
                             )
-                    prompts = [loaded_prompts[k] for _, k, _ in group]
+                    prompts = [loaded_prompts[k] for _, k, _, _ in group]
 
                     def do_generate(m, texts=texts, prompts=prompts):
                         return m.generate_voice_clone(
@@ -1462,11 +1422,11 @@ class QwenTTSGUI:
                         # Prompts loaded above may be pinned to the failed device — reload on
                         # CPU and pass explicitly, since do_generate's default was bound to
                         # the now-stale list.
-                        for _, key, _ in group:
+                        for _, key, _, _ in group:
                             loaded_prompts[key] = self._load_voice_clone_prompt(
                                 key, "cpu"
                             )
-                        prompts = [loaded_prompts[k] for _, k, _ in group]
+                        prompts = [loaded_prompts[k] for _, k, _, _ in group]
                         group_wavs, group_sr = do_generate(model, prompts=prompts)
                     else:
                         group_wavs, group_sr = do_generate(model)
@@ -1479,7 +1439,7 @@ class QwenTTSGUI:
                         "can't stitch this generation together."
                     )
 
-                for (i, _, _), wav in zip(group, group_wavs):
+                for (i, _, _, _), wav in zip(group, group_wavs):
                     wavs_by_index[i] = wav
 
             if len(segments) > 1:
@@ -1494,29 +1454,13 @@ class QwenTTSGUI:
             # voice change so the splice doesn't sound abrupt.
             silence_gap = np.zeros(int(sr * 0.15), dtype=wavs_by_index[0].dtype)
             pieces = []
-            for i, (kind, key, _) in enumerate(segments):
+            for i, (kind, key, _, _) in enumerate(segments):
                 if i > 0 and (kind, key) != (segments[i - 1][0], segments[i - 1][1]):
                     pieces.append(silence_gap)
                 pieces.append(wavs_by_index[i])
             final_wav = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
 
-            # Determine save location
-            save_folder = self.use_save_entry.get().strip()
-            output_dir = save_folder if save_folder else OUTPUT_DIR
-            if output_dir and not os.path.exists(output_dir):
-                os.makedirs(output_dir, exist_ok=True)
-
-            distinct_voices = {(kind, key) for kind, key, _ in segments}
-            if len(distinct_voices) == 1:
-                _, key = next(iter(distinct_voices))
-                filename_stub = f"{key}_output"
-            else:
-                filename_stub = "multivoice_output"
-
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            output_file = os.path.join(
-                output_dir, f"{filename_stub}_{timestamp}.{output_format}"
-            )
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
             if output_format == "wav":
                 sf.write(output_file, final_wav, sr)

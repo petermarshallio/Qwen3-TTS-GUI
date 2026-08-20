@@ -15,27 +15,33 @@ there when implemented.
       `generate_voice_clone` call, loading each of Base/CustomVoice at most once
 - [x] Unresolved `[Name]` markers block generate entirely, listing the bad names
 - [x] Typing `[` in the text box pops up a filtered, keyboard-navigable voice picker
-      (Enter/Tab/click inserts `Name]`; Escape/click-away/losing focus erases the
-      abandoned `[partial` text; typing `]` by hand leaves a manually-typed marker as-is)
-
-Simplification: language and the Instruction box stay global controls (applied to
-every segment) rather than per-segment — matches how they already worked before
-markers existed, and nothing so far has asked for per-segment language/instruction.
+      (Enter/Tab/click inserts `Name]`, cursor landing just before the `]` so
+      `:instruction` can follow; Escape/click-away/losing focus erases the abandoned
+      `[partial` text; typing `]` or `:` by hand leaves a manually-typed marker as-is)
+- [x] `[VoiceName:instruction]` sets a per-segment style instruction inline (superseded
+      the standalone Instruction text box — see below); an instruction on a voice-clone
+      segment (no instruct concept) warns rather than blocking
+- [x] There's no Voice/Instruction dropdown or text box left on the Use Voice tab at
+      all — every generation is entirely described by the text box's markers. Language
+      stays a separate, single dropdown (applies to every segment; nothing so far has
+      asked for per-segment language)
 
 ## CustomVoice model (preset voices)
 
-Landed together with a broader voice-picker redesign: Train Voice now has a "Voice"
-dropdown ("New..." + local custom voices, no presets — they aren't trainable), and Use
-Voice's dropdown lists custom voices + the 9 presets (suffixed `(Preset)`). Selecting a
-preset loads the CustomVoice checkpoint instead of Base.
+Landed together with a broader voice-picker redesign, since superseded by the
+`[VoiceName]` marker system above: Train Voice still has a "Voice" dropdown
+("New..." plus local custom voices, no presets — they aren't trainable) for
+training, but Use Voice has no dropdown of its own — voices are chosen via markers,
+resolved against the local custom-voice cache plus the 9 presets. A `[PresetName]`
+marker generates via the CustomVoice checkpoint instead of Base.
 
-- [x] Add a way to select the `CustomVoice` checkpoint (via the Use Voice dropdown,
-      resolved to `MODEL_REPO_CUSTOM_VOICE` when a preset is selected)
+- [x] Add a way to select the `CustomVoice` checkpoint (via a `[PresetName]` marker,
+      resolved to `MODEL_REPO_CUSTOM_VOICE`)
 - [x] Add a "Speaker" dropdown populated from `model.get_supported_speakers()` — actually
       hardcoded (`PRESET_VOICES`) rather than fetched at runtime, see decision below
       (9 presets: Vivian, Serena, Uncle_Fu, Dylan, Eric, Ryan, Aiden, Ono_Anna, Sohee)
-- [x] Add optional style "Instruction" text box (e.g. "say it in an angry tone") — shown
-      only when a preset is selected
+- [x] Add optional style instruction (e.g. "say it in an angry tone") — now the
+      `[PresetName:instruction]` marker syntax rather than a standalone text box
 - [x] Wire up to `model.generate_custom_voice(text, speaker, language, instruct=...)`
 
 Note: the speaker list is hardcoded, not fetched via `model.get_supported_speakers()` at
