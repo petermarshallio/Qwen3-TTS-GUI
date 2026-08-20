@@ -3,9 +3,11 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+from typing import ClassVar
 
 import av
 import numpy as np
@@ -179,6 +181,22 @@ def parse_voice_segments(text, lookup):
     return segments, errors, warnings
 
 
+def group_segments_by_kind(segments):
+    """Group parsed (kind, key, text, instruct) segments by kind, keeping each
+    segment's original index (needed to reassemble in order later).
+
+    Returns:
+        (groups, kinds_needed): `groups[kind]` is a list of (index, key, text,
+        instruct); `kinds_needed` orders "custom" (Base model) before "preset"
+        (CustomVoice model) — the order those models get loaded in.
+    """
+    groups = {}
+    for i, (kind, key, seg_text, instr) in enumerate(segments):
+        groups.setdefault(kind, []).append((i, key, seg_text, instr))
+    kinds_needed = [k for k in ("custom", "preset") if groups.get(k)]
+    return groups, kinds_needed
+
+
 def _is_cuda_compat_error(exc):
     """Whether `exc` looks like a CUDA kernel/device compatibility error (as opposed to
     some other RuntimeError) — the case worth silently falling back to CPU for."""
@@ -230,6 +248,104 @@ def reveal_in_file_manager(path):
             subprocess.run(["xdg-open", os.path.dirname(path)], check=False)
     except Exception:
         pass
+
+
+class ProgressPanel:
+    """A live step checklist + progress bar + elapsed timer for a background job
+    whose overall shape (a known sequence of named steps) is known up front, but
+    whose per-step duration isn't — there's no token-level progress hook to report,
+    so each step's bar segment pulses (indeterminate) while active and only snaps to
+    a real, filled fraction once that step actually finishes."""
+
+    PENDING, ACTIVE, DONE, FAILED = "pending", "active", "done", "failed"
+    GLYPHS: ClassVar[dict] = {PENDING: "○", ACTIVE: "●", DONE: "✓", FAILED: "✗"}
+    COLORS: ClassVar[dict] = {
+        PENDING: "gray",
+        ACTIVE: "#2b6cb0",
+        DONE: "#2f855a",
+        FAILED: "#c53030",
+    }
+
+    def __init__(self, parent):
+        self.frame = ttk.Frame(parent)
+
+        self.bar = ttk.Progressbar(self.frame, mode="determinate")
+        self.bar.pack(fill=tk.X, pady=(0, 6))
+
+        self.steps_frame = ttk.Frame(self.frame)
+        self.steps_frame.pack(fill=tk.X)
+
+        self.elapsed_label = ttk.Label(
+            self.frame, foreground="gray", font=("TkDefaultFont", 9)
+        )
+        self.elapsed_label.pack(anchor=tk.E, pady=(4, 0))
+
+        self._rows = []
+        self._start_time = None
+        self._timer_id = None
+
+    def set_steps(self, descriptions):
+        """(Re)build the checklist for a new run; every step starts pending."""
+        for row in self._rows:
+            row["frame"].destroy()
+        self._rows = []
+
+        self.bar.config(mode="determinate", maximum=max(len(descriptions), 1), value=0)
+        for desc in descriptions:
+            row_frame = ttk.Frame(self.steps_frame)
+            row_frame.pack(fill=tk.X, anchor=tk.W)
+            glyph = ttk.Label(
+                row_frame,
+                text=self.GLYPHS[self.PENDING],
+                width=2,
+                foreground=self.COLORS[self.PENDING],
+            )
+            glyph.pack(side=tk.LEFT)
+            label = ttk.Label(
+                row_frame, text=desc, foreground=self.COLORS[self.PENDING]
+            )
+            label.pack(side=tk.LEFT)
+            self._rows.append({"frame": row_frame, "glyph": glyph, "label": label})
+
+    def _set_state(self, index, state):
+        row = self._rows[index]
+        row["glyph"].config(text=self.GLYPHS[state], foreground=self.COLORS[state])
+        row["label"].config(foreground=self.COLORS[state])
+
+    def start_step(self, index):
+        """Mark step `index` active — pulses the bar, since we don't know how long
+        this particular step will take."""
+        self._set_state(index, self.ACTIVE)
+        self.bar.config(mode="indeterminate")
+        self.bar.start(12)
+
+    def complete_step(self, index):
+        """Mark step `index` done and advance the bar to a real, filled fraction."""
+        self.bar.stop()
+        self.bar.config(mode="determinate", value=index + 1)
+        self._set_state(index, self.DONE)
+
+    def fail_step(self, index):
+        self.bar.stop()
+        self.bar.config(mode="determinate")
+        self._set_state(index, self.FAILED)
+
+    def show(self, before=None):
+        self.frame.pack(fill=tk.X, padx=20, pady=(0, 10), before=before)
+        self._start_time = time.monotonic()
+        self._tick()
+
+    def hide(self):
+        if self._timer_id is not None:
+            self.frame.after_cancel(self._timer_id)
+            self._timer_id = None
+        self.bar.stop()
+        self.frame.pack_forget()
+
+    def _tick(self):
+        elapsed = int(time.monotonic() - self._start_time)
+        self.elapsed_label.config(text=f"Elapsed: {elapsed // 60}:{elapsed % 60:02d}")
+        self._timer_id = self.frame.after(1000, self._tick)
 
 
 class QwenTTSGUI:
@@ -495,13 +611,12 @@ class QwenTTSGUI:
 
     def set_train_busy(self, busy):
         if busy:
-            self.train_progress.pack(
-                fill=tk.X, padx=20, pady=(0, 10), before=self.train_status_label
+            self.train_progress_panel.set_steps(
+                ["Load model", "Build voice prompt", "Save voice"]
             )
-            self.train_progress.start(10)
+            self.train_progress_panel.show(before=self.train_status_label)
         else:
-            self.train_progress.stop()
-            self.train_progress.pack_forget()
+            self.train_progress_panel.hide()
 
         self._set_frame_enabled(self.train_frame, not busy)
         self.train_button.config(text="Training..." if busy else "Train Voice")
@@ -511,14 +626,12 @@ class QwenTTSGUI:
             self.voice_name_entry.config(state=tk.DISABLED)
 
     def set_use_busy(self, busy):
+        # Steps are set by generate_speech() before this is called with busy=True —
+        # they depend on the parsed [VoiceName] segments, unlike Train's fixed steps.
         if busy:
-            self.use_progress.pack(
-                fill=tk.X, padx=20, pady=(0, 10), before=self.use_status_label
-            )
-            self.use_progress.start(10)
+            self.use_progress_panel.show(before=self.use_status_label)
         else:
-            self.use_progress.stop()
-            self.use_progress.pack_forget()
+            self.use_progress_panel.hide()
 
         self._set_frame_enabled(self.use_frame, not busy)
         self.generate_button.config(text="Generating..." if busy else "Generate Speech")
@@ -668,8 +781,8 @@ class QwenTTSGUI:
         )
         self.train_status_label.pack(pady=10)
 
-        self.train_progress = ttk.Progressbar(self.train_frame, mode="indeterminate")
-        # Not packed here — shown only while training is in progress (set_train_busy).
+        self.train_progress_panel = ProgressPanel(self.train_frame)
+        # Not shown here — shown only while training is in progress (set_train_busy).
 
         self.train_button = ttk.Button(
             self.train_frame,
@@ -793,8 +906,8 @@ class QwenTTSGUI:
         self.use_status_label = ttk.Label(self.use_frame, text="", foreground="blue")
         self.use_status_label.pack(pady=10)
 
-        self.use_progress = ttk.Progressbar(self.use_frame, mode="indeterminate")
-        # Not packed here — shown only while generation is in progress (set_use_busy).
+        self.use_progress_panel = ProgressPanel(self.use_frame)
+        # Not shown here — shown only while generation is in progress (set_use_busy).
 
         # Generate opens a native Save As dialog (pre-filled with a dated default
         # filename) before starting, rather than writing to a persistent folder path.
@@ -1043,7 +1156,10 @@ class QwenTTSGUI:
             device_type: "cuda" or "cpu".
             recording_path: Recorded take to use, when method == "record".
         """
+        panel = self.train_progress_panel
+        step = 0
         try:
+            self.root.after(0, lambda: panel.start_step(0))
             self.root.after(
                 0,
                 lambda: self.train_status_label.config(
@@ -1053,6 +1169,7 @@ class QwenTTSGUI:
             model, device_type = self._load_model(
                 MODEL_REPO_BASE, device_type, status_label=self.train_status_label
             )
+            self.root.after(0, lambda: panel.complete_step(0))
 
             if method == "file":
                 audio_file = self.audio_file_entry.get().strip()
@@ -1101,6 +1218,8 @@ class QwenTTSGUI:
                 ref_audio = recording_path
                 ref_text = self.script_text
 
+            step = 1
+            self.root.after(0, lambda: panel.start_step(1))
             self.root.after(
                 0,
                 lambda: self.train_status_label.config(
@@ -1140,11 +1259,15 @@ class QwenTTSGUI:
                     MODEL_REPO_BASE, "cpu", show_warning=False
                 )
                 prompt_items = do_create_prompt(model)
+            self.root.after(0, lambda: panel.complete_step(1))
 
+            step = 2
+            self.root.after(0, lambda: panel.start_step(2))
             # Voices always live in the local cache (OUTPUT_DIR) — that's what makes
             # the voice picker's cache scan work.
             output_file = os.path.join(OUTPUT_DIR, f"{voice_name}.pt")
             torch.save(prompt_items, output_file)
+            self.root.after(0, lambda: panel.complete_step(2))
 
             self.root.after(
                 0,
@@ -1165,6 +1288,7 @@ class QwenTTSGUI:
 
         except Exception as e:
             error_msg = f"Error during training: {e}"
+            self.root.after(0, lambda i=step: panel.fail_step(i))
             self.root.after(
                 0,
                 lambda: self.train_status_label.config(
@@ -1200,6 +1324,7 @@ class QwenTTSGUI:
         if not output_file:
             return
 
+        self.use_progress_panel.set_steps(self._generation_steps(segments))
         self.set_use_busy(True)
 
         thread = threading.Thread(
@@ -1231,6 +1356,22 @@ class QwenTTSGUI:
         if output_file:
             self.last_save_dir = os.path.dirname(output_file)
         return output_file
+
+    def _generation_steps(self, segments):
+        """Step descriptions for the progress panel, matching exactly what
+        `_generate_speech_thread` will actually do, in the same order — one step per
+        voice-kind group, then Stitch audio (only if there's more than one segment to
+        stitch), then Save file."""
+        groups, kinds_needed = group_segments_by_kind(segments)
+        steps = []
+        for kind in kinds_needed:
+            names = ", ".join(sorted({key for _, key, _, _ in groups[kind]}))
+            kind_label = "voice-clone" if kind == "custom" else "preset"
+            steps.append(f"Generate ({kind_label}): {names}")
+        if len(segments) > 1:
+            steps.append("Stitch audio")
+        steps.append("Save file")
+        return steps
 
     def _load_voice_clone_prompt(self, key, device_type):
         """Load a trained custom voice's VoiceClonePromptItem.
@@ -1309,13 +1450,12 @@ class QwenTTSGUI:
             language: One of SUPPORTED_LANGUAGES, applied to every segment.
             output_file: Full path chosen via the Save As dialog in `generate_speech`.
         """
+        panel = self.use_progress_panel
+        step = 0
         try:
             device_type = self.device_type.get()
 
-            groups = {}  # kind -> list of (segment_index, key, text, instruct)
-            for i, (kind, key, seg_text, instr) in enumerate(segments):
-                groups.setdefault(kind, []).append((i, key, seg_text, instr))
-            kinds_needed = [k for k in ("custom", "preset") if groups.get(k)]
+            groups, kinds_needed = group_segments_by_kind(segments)
 
             wavs_by_index = {}
             sr = None
@@ -1324,6 +1464,8 @@ class QwenTTSGUI:
             total_groups = len(kinds_needed)
 
             for group_index, kind in enumerate(kinds_needed):
+                step = group_index
+                self.root.after(0, lambda i=step: panel.start_step(i))
                 group = groups[kind]
                 model_repo = (
                     MODEL_REPO_CUSTOM_VOICE if kind == "preset" else MODEL_REPO_BASE
@@ -1441,8 +1583,11 @@ class QwenTTSGUI:
 
                 for (i, _, _, _), wav in zip(group, group_wavs):
                     wavs_by_index[i] = wav
+                self.root.after(0, lambda i=group_index: panel.complete_step(i))
 
             if len(segments) > 1:
+                step = total_groups
+                self.root.after(0, lambda i=step: panel.start_step(i))
                 self.root.after(
                     0,
                     lambda: self.use_status_label.config(
@@ -1460,12 +1605,19 @@ class QwenTTSGUI:
                 pieces.append(wavs_by_index[i])
             final_wav = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
 
+            if len(segments) > 1:
+                self.root.after(0, lambda i=step: panel.complete_step(i))
+
+            step = total_groups + (1 if len(segments) > 1 else 0)
+            self.root.after(0, lambda i=step: panel.start_step(i))
+
             os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
             if output_format == "wav":
                 sf.write(output_file, final_wav, sr)
             else:
                 encode_audio(final_wav, sr, output_file, output_format)
+            self.root.after(0, lambda i=step: panel.complete_step(i))
 
             self.root.after(
                 0,
@@ -1483,6 +1635,7 @@ class QwenTTSGUI:
 
         except Exception as e:
             error_msg = f"Error during generation: {e}"
+            self.root.after(0, lambda i=step: panel.fail_step(i))
             self.root.after(
                 0,
                 lambda: self.use_status_label.config(text=error_msg, foreground="red"),
