@@ -82,6 +82,49 @@ SUPPORTED_LANGUAGES = [
 
 NEW_VOICE_LABEL = "New..."
 
+# Read-aloud reference scripts offered on the Train Voice > Record tab, ordered
+# shortest-to-longest. "Original" is this app's very first script (kept for anyone
+# already used to it); the other four grow in length, phonetic variety (plosives,
+# fricatives, nasals, sibilants, vowel spread), and sentence-type variety (statement,
+# question, exclamation) — "Comprehensive" is deliberately the longest and richest,
+# repeating most sound classes more than once.
+TRAINING_SCRIPTS = {
+    "Original (~35s)": (
+        "On a warm Saturday morning, the quick brown fox jumped over several lazy "
+        "dogs while distant musicians played jazzy tunes near the quiet park. "
+        "People checked their phones, argued about numbers, dates, and prices, and "
+        "casually mentioned names like Alex, Jordan, and Taylor. A cyclist shouted "
+        "warnings, a train horn echoed, and someone asked, ‘Why does this even "
+        "matter?’ as rain began falling lightly at exactly 9:47 a.m., changing "
+        "plans, moods, and expectations all at once."
+    ),
+    "Quick (~5s)": "The quick brown fox jumped swiftly over three lazy sleeping dogs.",
+    "Short (~10s)": (
+        "Good morning! I brewed a fresh pot of coffee and opened the windows. Could "
+        "you check if it's still raining outside before we leave at nine?"
+    ),
+    "Standard (~18s)": (
+        "Good morning! I just got back from a walk around the lake, and it's "
+        "surprisingly warm for October. Did you know our flight leaves at 6:45, "
+        "not 7:15? We should double-check the tickets before Thursday — just "
+        "to be safe, and maybe grab a quick bite first."
+    ),
+    "Comprehensive (~55s)": (
+        "Good afternoon! My name is Jonathan, and I'd like to tell you about a "
+        "rather peculiar Thursday. It started at exactly 7:15, when a sudden "
+        "thunderstorm rattled the windows and startled the neighbor's three dogs. "
+        "‘Why does this always happen on my day off?’ I muttered, "
+        "grabbing a thick jacket and rushing outside. By noon, the sky had cleared "
+        "completely — sunshine, blue skies, and a gentle breeze replaced the "
+        "chaos. We quickly rescheduled the picnic to 2:30, bought fresh "
+        "strawberries, cheese, and sparkling lemonade, and invited twelve friends. "
+        "Should we also bring umbrellas, just in case? Absolutely — better "
+        "safe than soaked! By evening, laughter echoed through the garden as "
+        "fireworks lit up the darkening sky, and everyone agreed: sometimes the "
+        "strangest days become the best memories."
+    ),
+}
+
 
 def list_custom_voices():
     """Voice names available in the local cache (OUTPUT_DIR/*.pt)."""
@@ -765,16 +808,28 @@ class QwenTTSGUI:
             self.train_frame, text="Recording", padding=10
         )
 
-        self.script_text = "On a warm Saturday morning, the quick brown fox jumped over several lazy dogs while distant musicians played jazzy tunes near the quiet park. People checked their phones, argued about numbers, dates, and prices, and casually mentioned names like Alex, Jordan, and Taylor. A cyclist shouted warnings, a train horn echoed, and someone asked, ‘Why does this even matter?’ as rain began falling lightly at exactly 9:47 a.m., changing plans, moods, and expectations all at once."
+        script_picker_frame = ttk.Frame(self.record_frame)
+        script_picker_frame.pack(fill=tk.X, pady=5)
         ttk.Label(
-            self.record_frame, text="Script to read:", font=("Arial", 10, "bold")
-        ).pack(anchor=tk.W, pady=5)
-        script_display = scrolledtext.ScrolledText(
+            script_picker_frame, text="Script to read:", font=("Arial", 10, "bold")
+        ).pack(side=tk.LEFT, padx=(0, 5))
+        self.script_combo = ttk.Combobox(
+            script_picker_frame,
+            width=20,
+            state="readonly",
+            values=list(TRAINING_SCRIPTS.keys()),
+        )
+        self.script_combo.set(next(iter(TRAINING_SCRIPTS)))
+        self.script_combo.pack(side=tk.LEFT)
+        self.script_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self.on_script_selected()
+        )
+
+        self.script_display = scrolledtext.ScrolledText(
             self.record_frame, height=7, width=50, wrap=tk.WORD
         )
-        script_display.insert("1.0", self.script_text)
-        script_display.config(state=tk.DISABLED)
-        script_display.pack(fill=tk.X, pady=5)
+        self.script_display.pack(fill=tk.X, pady=5)
+        self.on_script_selected()
 
         self.record_status_label = ttk.Label(
             self.record_frame, text="Ready to record", foreground="green"
@@ -812,6 +867,14 @@ class QwenTTSGUI:
 
         self.update_train_method_visibility()
         self.refresh_train_voice_list()
+
+    def on_script_selected(self):
+        """Refresh the read-only preview to match the picked training script."""
+        text = TRAINING_SCRIPTS[self.script_combo.get()]
+        self.script_display.config(state=tk.NORMAL)
+        self.script_display.delete("1.0", tk.END)
+        self.script_display.insert("1.0", text)
+        self.script_display.config(state=tk.DISABLED)
 
     def update_train_method_visibility(self):
         """Show only the File Input or Recording section, matching the selected training method."""
@@ -1161,27 +1224,33 @@ class QwenTTSGUI:
         device_type = self.device_type.get()
 
         recording_path = None
+        script_text = None
         if method == "record":
             recording_path = self.recording_map.get(self.recording_combo.get())
+            script_text = TRAINING_SCRIPTS[self.script_combo.get()]
 
         self.set_train_busy(True)
 
         thread = threading.Thread(
             target=self._train_voice_thread,
-            args=(voice_name, method, device_type, recording_path),
+            args=(voice_name, method, device_type, recording_path, script_text),
         )
         thread.daemon = True
         thread.start()
 
-    def _train_voice_thread(self, voice_name, method, device_type, recording_path=None):
+    def _train_voice_thread(
+        self, voice_name, method, device_type, recording_path=None, script_text=None
+    ):
         """Build and save a VoiceClonePromptItem for `voice_name` (background thread).
 
         Args:
             voice_name: Name to save the trained voice under (OUTPUT_DIR/{voice_name}.pt).
             method: "file" (audio_file_entry + transcript_entry) or "record"
-                (recording_path + the fixed read-aloud script).
+                (recording_path + script_text).
             device_type: "cuda" or "cpu".
             recording_path: Recorded take to use, when method == "record".
+            script_text: The training script the recording actually read aloud
+                (picked from TRAINING_SCRIPTS), when method == "record".
         """
         panel = self.train_progress_panel
         step = 0
@@ -1243,7 +1312,7 @@ class QwenTTSGUI:
                     return
 
                 ref_audio = recording_path
-                ref_text = self.script_text
+                ref_text = script_text
 
             step = 1
             self.root.after(0, lambda: panel.start_step(1))
