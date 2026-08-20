@@ -10,6 +10,7 @@ from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
 import threading
 import os
 import sys
+from datetime import datetime
 
 # Fix CUDA detection in PyInstaller bundles
 # PyInstaller sometimes doesn't properly detect CUDA libraries
@@ -829,7 +830,8 @@ class QwenTTSGUI:
             if output_dir and not os.path.exists(output_dir):
                 os.makedirs(output_dir, exist_ok=True)
 
-            output_file = os.path.join(output_dir, f"{key}_output.{output_format}")
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            output_file = os.path.join(output_dir, f"{key}_output_{timestamp}.{output_format}")
 
             if output_format == "wav":
                 sf.write(output_file, wavs[0], sr)
