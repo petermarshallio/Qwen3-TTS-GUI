@@ -56,10 +56,21 @@ before the user has done anything. The 9 names are fixed for this released check
 
 ## VoiceDesign model
 
-- [ ] Add a way to select the `VoiceDesign` checkpoint
-- [ ] Add a "Voice Design Instruction" text box (natural-language voice description,
-      e.g. "warm elderly British female voice")
-- [ ] Wire up to `model.generate_voice_design(text, instruct, language)`
+Added as a third Train Voice method ("Design from Description"), not a Use Voice
+option — per qwen_tts's own recommended workflow: design a reference clip once, then
+clone-prompt it exactly like any other reference recording, so a designed voice is
+reusable via `[VoiceName]` markers just like a recorded one, with no separate
+"VoiceDesign" concept anywhere downstream.
+
+- [x] Add a way to select the `VoiceDesign` checkpoint (`MODEL_REPO_VOICE_DESIGN` —
+      no size choice, since only a 1.7B release exists)
+- [x] Add a "Voice Design Instruction" text box (natural-language voice description,
+      e.g. "warm elderly British female voice") — the description entry on the new
+      "Design from Description" training method
+- [x] Wire up to `model.generate_voice_design(text, instruct, language)` — `text` is
+      `VOICE_DESIGN_REFERENCE_TEXT` (the "Standard" training script; no picker
+      exposed here since nobody has to read it aloud), then the synthesized clip
+      feeds `create_voice_clone_prompt` the same way a recording would
 
 ## Language selection
 

@@ -143,6 +143,16 @@ TRAINING_SCRIPTS = {
     ),
 }
 
+# VoiceDesign has no 0.6B release (see MODEL_REPOS_BASE/MODEL_REPOS_CUSTOM_VOICE) and
+# isn't offered a size choice in Configure — this is the only checkpoint there is.
+MODEL_REPO_VOICE_DESIGN = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+
+# The reference clip qwen_tts's own docs recommend synthesizing once with VoiceDesign
+# before feeding it into create_voice_clone_prompt, same as any other reference
+# recording — reusing "Standard" rather than exposing a picker, since nobody has to
+# read this aloud themselves.
+VOICE_DESIGN_REFERENCE_TEXT = TRAINING_SCRIPTS["Standard (~18s)"]
+
 
 def list_custom_voices():
     """Voice names available in the local cache (OUTPUT_DIR/*.pt)."""
@@ -706,9 +716,10 @@ class QwenTTSGUI:
 
     def set_train_busy(self, busy):
         if busy:
-            self.train_progress_panel.set_steps(
-                ["Load model", "Build voice prompt", "Save voice"]
-            )
+            steps = ["Load model", "Build voice prompt", "Save voice"]
+            if self.train_method.get() == "design":
+                steps = ["Design reference voice", *steps]
+            self.train_progress_panel.set_steps(steps)
             self.train_progress_panel.show(before=self.train_status_label)
         else:
             self.train_progress_panel.hide()
@@ -822,6 +833,13 @@ class QwenTTSGUI:
             value="record",
             command=self.update_train_method_visibility,
         ).pack(anchor=tk.W, pady=5)
+        ttk.Radiobutton(
+            method_frame,
+            text="Design from Description",
+            variable=self.train_method,
+            value="design",
+            command=self.update_train_method_visibility,
+        ).pack(anchor=tk.W, pady=5)
 
         # File input section (shown only for the "file" method)
         self.file_frame = ttk.LabelFrame(
@@ -900,6 +918,22 @@ class QwenTTSGUI:
         self.recording_combo = ttk.Combobox(take_frame, width=30, state="disabled")
         self.recording_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
 
+        # Design section (shown only for the "design" method): no reference audio at
+        # all — a natural-language description synthesizes a voice from scratch via
+        # the VoiceDesign model, which then gets clone-prompted like any other voice.
+        self.design_frame = ttk.LabelFrame(
+            self.train_frame, text="Voice Design", padding=10
+        )
+        ttk.Label(
+            self.design_frame, text="Voice Description:", font=("Arial", 10, "bold")
+        ).pack(anchor=tk.W, pady=5)
+        self.voice_design_instruct_entry = ttk.Entry(self.design_frame, width=50)
+        self.voice_design_instruct_entry.pack(fill=tk.X, pady=5)
+        self.add_placeholder_entry(
+            self.voice_design_instruct_entry,
+            "e.g. warm elderly British female voice",
+        )
+
         self.train_status_label = ttk.Label(
             self.train_frame, text="", foreground="blue"
         )
@@ -935,17 +969,20 @@ class QwenTTSGUI:
         self.script_display.config(state=tk.DISABLED)
 
     def update_train_method_visibility(self):
-        """Show only the File Input or Recording section, matching the selected training method."""
-        if self.train_method.get() == "file":
-            self.record_frame.pack_forget()
-            self.file_frame.pack(
-                fill=tk.X, padx=20, pady=10, before=self.train_status_label
-            )
-        else:
-            self.file_frame.pack_forget()
-            self.record_frame.pack(
-                fill=tk.X, padx=20, pady=10, before=self.train_status_label
-            )
+        """Show only the File Input, Recording, or Voice Design section, matching
+        the selected training method."""
+        method = self.train_method.get()
+        frame_by_method = {
+            "file": self.file_frame,
+            "record": self.record_frame,
+            "design": self.design_frame,
+        }
+        for other_method, frame in frame_by_method.items():
+            if other_method != method:
+                frame.pack_forget()
+        frame_by_method[method].pack(
+            fill=tk.X, padx=20, pady=10, before=self.train_status_label
+        )
 
     def refresh_train_voice_list(self):
         """Repopulate the Train tab's voice picker from the local voice cache."""
@@ -1434,9 +1471,16 @@ class QwenTTSGUI:
 
         recording_path = None
         script_text = None
+        design_instruct = None
         if method == "record":
             recording_path = self.recording_map.get(self.recording_combo.get())
             script_text = TRAINING_SCRIPTS[self.script_combo.get()]
+        elif method == "design":
+            design_instruct = self.get_entry_value(self.voice_design_instruct_entry)
+            if not design_instruct:
+                messagebox.showerror("Error", "Please enter a voice description")
+                return
+            script_text = VOICE_DESIGN_REFERENCE_TEXT
 
         self.set_train_busy(True)
 
@@ -1449,6 +1493,7 @@ class QwenTTSGUI:
                 recording_path,
                 script_text,
                 x_vector_only,
+                design_instruct,
             ),
         )
         thread.daemon = True
@@ -1462,25 +1507,67 @@ class QwenTTSGUI:
         recording_path=None,
         script_text=None,
         x_vector_only=False,
+        design_instruct=None,
     ):
         """Build and save a VoiceClonePromptItem for `voice_name` (background thread).
 
         Args:
             voice_name: Name to save the trained voice under (OUTPUT_DIR/{voice_name}.pt).
-            method: "file" (audio_file_entry + transcript_entry) or "record"
-                (recording_path + script_text).
+            method: "file" (audio_file_entry + transcript_entry), "record"
+                (recording_path + script_text), or "design" (design_instruct +
+                script_text — synthesizes a reference clip with VoiceDesign first,
+                then clone-prompts it like any other reference recording).
             device_type: "cuda" or "cpu".
             recording_path: Recorded take to use, when method == "record".
-            script_text: The training script the recording actually read aloud
-                (picked from TRAINING_SCRIPTS), when method == "record".
+            script_text: The training script read aloud (method == "record") or
+                synthesized by VoiceDesign (method == "design") — either way, the
+                exact text the resulting reference audio actually says.
             x_vector_only: "Quick clone" — use only the reference audio's speaker
                 embedding, skipping in-context conditioning on its transcript.
                 Faster and needs no matching transcript, but lower fidelity.
+            design_instruct: Natural-language voice description, when
+                method == "design" (e.g. "warm elderly British female voice").
         """
         panel = self.train_progress_panel
+        # "design" has an extra leading step (see set_train_busy) — everything below
+        # is indexed off this offset so step numbers stay correct either way.
+        step_offset = 1 if method == "design" else 0
         step = 0
         try:
-            self.root.after(0, lambda: panel.start_step(0))
+            if method == "design":
+                self.root.after(0, lambda: panel.start_step(0))
+                self.root.after(
+                    0,
+                    lambda: self.train_status_label.config(
+                        text="Designing reference voice...", foreground="blue"
+                    ),
+                )
+                design_dtype = DTYPE_MAP[self.train_dtype.get()]
+                design_model, _ = self._load_model(
+                    MODEL_REPO_VOICE_DESIGN, device_type, design_dtype
+                )
+
+                def do_design(m):
+                    return m.generate_voice_design(
+                        text=script_text, instruct=design_instruct, language="Auto"
+                    )
+
+                try:
+                    design_wavs, design_sr = do_design(design_model)
+                except (RuntimeError, torch.cuda.CudaError) as cuda_error:
+                    if not _is_cuda_compat_error(cuda_error):
+                        raise
+                    design_model, _ = self._load_model(
+                        MODEL_REPO_VOICE_DESIGN, "cpu", design_dtype
+                    )
+                    design_wavs, design_sr = do_design(design_model)
+
+                ref_audio = (design_wavs[0], design_sr)
+                ref_text = script_text
+                self.root.after(0, lambda: panel.complete_step(0))
+
+            step = step_offset
+            self.root.after(0, lambda i=step: panel.start_step(i))
             self.root.after(
                 0,
                 lambda: self.train_status_label.config(
@@ -1490,9 +1577,14 @@ class QwenTTSGUI:
             model_repo = MODEL_REPOS_BASE[self.train_model_size.get()]
             dtype = DTYPE_MAP[self.train_dtype.get()]
             model, device_type = self._load_model(
-                model_repo, device_type, dtype, status_label=self.train_status_label
+                model_repo,
+                device_type,
+                dtype,
+                # Already warned once above if method == "design" loaded first.
+                show_warning=(step_offset == 0),
+                status_label=self.train_status_label,
             )
-            self.root.after(0, lambda: panel.complete_step(0))
+            self.root.after(0, lambda i=step: panel.complete_step(i))
 
             if method == "file":
                 audio_file = self.audio_file_entry.get().strip()
@@ -1529,7 +1621,7 @@ class QwenTTSGUI:
 
                 ref_audio = audio_file
 
-            else:  # recording
+            elif method == "record":
                 if not recording_path or not os.path.exists(recording_path):
                     self.root.after(
                         0,
@@ -1543,8 +1635,11 @@ class QwenTTSGUI:
                 ref_audio = recording_path
                 ref_text = script_text
 
-            step = 1
-            self.root.after(0, lambda: panel.start_step(1))
+            # else: method == "design" — ref_audio/ref_text already set above, from
+            # the synthesized reference clip.
+
+            step = step_offset + 1
+            self.root.after(0, lambda i=step: panel.start_step(i))
             self.root.after(
                 0,
                 lambda: self.train_status_label.config(
@@ -1584,15 +1679,15 @@ class QwenTTSGUI:
                     model_repo, "cpu", dtype, show_warning=False
                 )
                 prompt_items = do_create_prompt(model)
-            self.root.after(0, lambda: panel.complete_step(1))
+            self.root.after(0, lambda i=step: panel.complete_step(i))
 
-            step = 2
-            self.root.after(0, lambda: panel.start_step(2))
+            step = step_offset + 2
+            self.root.after(0, lambda i=step: panel.start_step(i))
             # Voices always live in the local cache (OUTPUT_DIR) — that's what makes
             # the voice picker's cache scan work.
             output_file = os.path.join(OUTPUT_DIR, f"{voice_name}.pt")
             torch.save(prompt_items, output_file)
-            self.root.after(0, lambda: panel.complete_step(2))
+            self.root.after(0, lambda i=step: panel.complete_step(i))
 
             self.root.after(
                 0,
