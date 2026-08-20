@@ -52,6 +52,28 @@ OUTPUT_DIR = os.path.join(_base_dir, "local")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 MIC_RECORDING_PATH = os.path.join(OUTPUT_DIR, "mic.wav")
 
+MODEL_REPO_BASE = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+MODEL_REPO_CUSTOM_VOICE = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+
+# Fixed speaker list for MODEL_REPO_CUSTOM_VOICE (from the model card). Not fetched
+# dynamically via AutoConfig, which would need network/HF-cache access just to
+# populate a dropdown before the user has done anything.
+PRESET_VOICES = ["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee"]
+
+SUPPORTED_LANGUAGES = ["Auto", "Chinese", "English", "Japanese", "Korean", "German",
+                        "French", "Russian", "Portuguese", "Spanish", "Italian"]
+
+NEW_VOICE_LABEL = "New..."
+
+
+def list_custom_voices():
+    """Voice names available in the local cache (OUTPUT_DIR/*.pt)."""
+    if not os.path.isdir(OUTPUT_DIR):
+        return []
+    return sorted(
+        os.path.splitext(f)[0] for f in os.listdir(OUTPUT_DIR) if f.lower().endswith(".pt")
+    )
+
 
 def encode_audio(samples, sr, output_file, output_format):
     """Encode a float32 numpy array to mp3/m4a via PyAV (bundles its own
@@ -113,22 +135,21 @@ class QwenTTSGUI:
         title_label = ttk.Label(self.train_frame, text="Train a New Voice", font=("Arial", 16, "bold"))
         title_label.pack(pady=10)
         
-        # Voice name input
+        # Voice picker: "New..." to create a voice, or an existing custom voice to
+        # re-train/overwrite it. Presets aren't shown here — they aren't trainable.
+        voice_frame = ttk.Frame(self.train_frame)
+        voice_frame.pack(fill=tk.X, padx=20, pady=10)
+        ttk.Label(voice_frame, text="Voice:").pack(side=tk.LEFT, padx=5)
+        self.train_voice_combo = ttk.Combobox(voice_frame, width=27, state="readonly")
+        self.train_voice_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        self.train_voice_combo.bind("<<ComboboxSelected>>", lambda e: self.on_train_voice_selected())
+
         name_frame = ttk.Frame(self.train_frame)
         name_frame.pack(fill=tk.X, padx=20, pady=10)
         ttk.Label(name_frame, text="Voice Name:").pack(side=tk.LEFT, padx=5)
         self.voice_name_entry = ttk.Entry(name_frame, width=30)
         self.voice_name_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        
-        # Save location for trained voice
-        save_frame = ttk.Frame(self.train_frame)
-        save_frame.pack(fill=tk.X, padx=20, pady=10)
-        ttk.Label(save_frame, text="Save Location:").pack(side=tk.LEFT, padx=5)
-        self.train_save_entry = ttk.Entry(save_frame, width=30)
-        self.train_save_entry.insert(0, OUTPUT_DIR)
-        self.train_save_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ttk.Button(save_frame, text="Browse", command=self.browse_save_location_train).pack(side=tk.LEFT, padx=5)
-        
+
         # Device selection
         device_frame = ttk.LabelFrame(self.train_frame, text="Device Selection", padding=10)
         device_frame.pack(fill=tk.X, padx=20, pady=10)
@@ -192,6 +213,7 @@ class QwenTTSGUI:
         train_button.pack(pady=20)
 
         self.update_train_method_visibility()
+        self.refresh_train_voice_list()
 
     def update_train_method_visibility(self):
         """Show only the File Input or Recording section, matching the selected training method."""
@@ -202,32 +224,72 @@ class QwenTTSGUI:
             self.file_frame.pack_forget()
             self.record_frame.pack(fill=tk.X, padx=20, pady=10, before=self.train_status_label)
 
+    def refresh_train_voice_list(self):
+        """Repopulate the Train tab's voice picker from the local voice cache."""
+        current = self.train_voice_combo.get()
+        values = [NEW_VOICE_LABEL] + list_custom_voices()
+        self.train_voice_combo["values"] = values
+        if current in values:
+            self.train_voice_combo.set(current)
+        else:
+            self.train_voice_combo.set(NEW_VOICE_LABEL)
+        self.on_train_voice_selected()
+
+    def on_train_voice_selected(self):
+        """Editable+empty for a new voice; disabled+filled for an existing one (update flow)."""
+        selected = self.train_voice_combo.get()
+        self.voice_name_entry.config(state=tk.NORMAL)
+        self.voice_name_entry.delete(0, tk.END)
+        if selected != NEW_VOICE_LABEL:
+            self.voice_name_entry.insert(0, selected)
+            self.voice_name_entry.config(state=tk.DISABLED)
+
+    def refresh_voice_lists(self):
+        """Repopulate both tabs' voice pickers — called after a voice is (re-)trained
+        so it shows up immediately without restarting the app."""
+        self.refresh_train_voice_list()
+        self.refresh_use_voice_list()
+
     def setup_use_tab(self):
         # Title
         title_label = ttk.Label(self.use_frame, text="Generate Speech from a pretrained Voice", font=("Arial", 16, "bold"))
         title_label.pack(pady=10)
         
-        # Voice selection
+        # Voice selection: custom voices from the local cache + read-only presets
         voice_frame = ttk.LabelFrame(self.use_frame, text="Voice Selection", padding=10)
         voice_frame.pack(fill=tk.X, padx=20, pady=10)
-        
+
         voice_select_frame = ttk.Frame(voice_frame)
         voice_select_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(voice_select_frame, text="Voice File:").pack(side=tk.LEFT, padx=5)
-        self.voice_file_entry = ttk.Entry(voice_select_frame, width=40)
-        self.voice_file_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ttk.Button(voice_select_frame, text="Browse", command=self.browse_voice_file).pack(side=tk.LEFT, padx=5)
-        
+        ttk.Label(voice_select_frame, text="Voice:").pack(side=tk.LEFT, padx=5)
+        self.use_voice_combo = ttk.Combobox(voice_select_frame, width=37, state="readonly")
+        self.use_voice_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        self.use_voice_combo.bind("<<ComboboxSelected>>", lambda e: self.on_use_voice_selected())
+
+        language_frame = ttk.Frame(voice_frame)
+        language_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(language_frame, text="Language:").pack(side=tk.LEFT, padx=5)
+        self.use_language_combo = ttk.Combobox(language_frame, width=37, state="readonly",
+                                                values=SUPPORTED_LANGUAGES)
+        self.use_language_combo.set("Auto")
+        self.use_language_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
+        # Instruction (shown only for preset voices, e.g. "say it in an angry tone")
+        self.instruct_frame = ttk.Frame(voice_frame)
+        ttk.Label(self.instruct_frame, text="Instruction:").pack(side=tk.LEFT, padx=5)
+        self.instruct_entry = ttk.Entry(self.instruct_frame, width=37)
+        self.instruct_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
         # Device selection
         device_frame = ttk.LabelFrame(self.use_frame, text="Device Selection", padding=10)
         device_frame.pack(fill=tk.X, padx=20, pady=10)
-        
+
         self.use_device_type = tk.StringVar(value="cuda")
-        ttk.Radiobutton(device_frame, text="CUDA (GPU)", variable=self.use_device_type, 
+        ttk.Radiobutton(device_frame, text="CUDA (GPU)", variable=self.use_device_type,
                        value="cuda").pack(side=tk.LEFT, padx=10)
-        ttk.Radiobutton(device_frame, text="CPU", variable=self.use_device_type, 
+        ttk.Radiobutton(device_frame, text="CPU", variable=self.use_device_type,
                        value="cpu").pack(side=tk.LEFT, padx=10)
-        
+
         # Text input
         text_frame = ttk.LabelFrame(self.use_frame, text="Text to Generate", padding=10)
         text_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
@@ -264,7 +326,40 @@ class QwenTTSGUI:
         generate_button = ttk.Button(self.use_frame, text="Generate Speech", command=self.generate_speech,
                                     style="Accent.TButton")
         generate_button.pack(pady=20)
-        
+
+        self.use_voice_map = {}
+        self.refresh_use_voice_list()
+
+    def refresh_use_voice_list(self):
+        """Repopulate the Use tab's voice picker with local custom voices + presets."""
+        current = self.use_voice_combo.get()
+        self.use_voice_map = {}
+        values = []
+        for name in list_custom_voices():
+            self.use_voice_map[name] = ("custom", name)
+            values.append(name)
+        for speaker in PRESET_VOICES:
+            label = f"{speaker} (Preset)"
+            self.use_voice_map[label] = ("preset", speaker)
+            values.append(label)
+
+        self.use_voice_combo["values"] = values
+        if current in self.use_voice_map:
+            self.use_voice_combo.set(current)
+        elif values:
+            self.use_voice_combo.set(values[0])
+        else:
+            self.use_voice_combo.set("")
+        self.on_use_voice_selected()
+
+    def on_use_voice_selected(self):
+        """Show the Instruction box only for preset voices (generate_custom_voice's instruct)."""
+        kind, _ = self.use_voice_map.get(self.use_voice_combo.get(), (None, None))
+        if kind == "preset":
+            self.instruct_frame.pack(fill=tk.X, pady=5)
+        else:
+            self.instruct_frame.pack_forget()
+
     def browse_audio_file(self):
         filename = filedialog.askopenfilename(
             title="Select Audio File",
@@ -274,26 +369,6 @@ class QwenTTSGUI:
             self.audio_file_entry.delete(0, tk.END)
             self.audio_file_entry.insert(0, filename)
     
-    def browse_voice_file(self):
-        filename = filedialog.askopenfilename(
-            title="Select Voice File",
-            initialdir=OUTPUT_DIR,
-            filetypes=[("PyTorch files", "*.pt"), ("All files", "*.*")]
-        )
-        if filename:
-            self.voice_file_entry.delete(0, tk.END)
-            self.voice_file_entry.insert(0, filename)
-
-    def browse_save_location_train(self):
-        """Browse for save folder when training a voice"""
-        folder = filedialog.askdirectory(
-            title="Select Folder to Save Trained Voice",
-            initialdir=OUTPUT_DIR
-        )
-        if folder:
-            self.train_save_entry.delete(0, tk.END)
-            self.train_save_entry.insert(0, folder)
-
     def browse_save_location_use(self):
         """Browse for save folder when generating speech"""
         folder = filedialog.askdirectory(
@@ -388,7 +463,14 @@ class QwenTTSGUI:
         if not voice_name:
             messagebox.showerror("Error", "Please enter a voice name")
             return
-        
+
+        if self.train_voice_combo.get() == NEW_VOICE_LABEL and voice_name in list_custom_voices():
+            if not messagebox.askyesno(
+                "Overwrite Voice?",
+                f"A voice named '{voice_name}' already exists. Overwrite it?"
+            ):
+                return
+
         method = self.train_method.get()
         device_type = self.device_type.get()
         
@@ -406,7 +488,7 @@ class QwenTTSGUI:
             config = self.get_model_config(device_type, show_warning=True)
             try:
                 model = Qwen3TTSModel.from_pretrained(
-                    "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                    MODEL_REPO_BASE,
                     **config
                 )
             except (RuntimeError, torch.cuda.CudaError) as cuda_error:
@@ -423,13 +505,13 @@ class QwenTTSGUI:
                     # Retry with CPU config
                     config = self.get_model_config("cpu", show_warning=False)
                     model = Qwen3TTSModel.from_pretrained(
-                        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                        MODEL_REPO_BASE,
                         **config
                     )
                 else:
                     # Re-raise if it's not a CUDA compatibility error
                     raise
-            
+
             ref_audio = None
             ref_text = None
             
@@ -484,7 +566,7 @@ class QwenTTSGUI:
                     # Reload model with CPU config
                     config = self.get_model_config("cpu", show_warning=False)
                     model = Qwen3TTSModel.from_pretrained(
-                        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                        MODEL_REPO_BASE,
                         **config
                     )
                     # Retry the operation
@@ -497,28 +579,19 @@ class QwenTTSGUI:
                     # Re-raise if it's not a CUDA compatibility error
                     raise
             
-            # Determine save location
-            save_folder = self.train_save_entry.get().strip()
-            if save_folder:
-                # Use user-specified folder
-                output_file = os.path.join(save_folder, f"{voice_name}.pt")
-            else:
-                # Default to the gitignored local output folder
-                output_file = os.path.join(OUTPUT_DIR, f"{voice_name}.pt")
-            
-            # Create directory if it doesn't exist
-            output_dir = os.path.dirname(output_file)
-            if output_dir and not os.path.exists(output_dir):
-                os.makedirs(output_dir, exist_ok=True)
-            
+            # Voices always live in the local cache (OUTPUT_DIR) — that's what makes
+            # the voice picker's cache scan work.
+            output_file = os.path.join(OUTPUT_DIR, f"{voice_name}.pt")
+
             # Save the prompt
             torch.save(prompt_items, output_file)
-            
+
             self.root.after(0, lambda: self.train_status_label.config(
-                text=f"Voice '{voice_name}' trained successfully! Saved to {output_file}", 
+                text=f"Voice '{voice_name}' trained successfully! Saved to {output_file}",
                 foreground="green"))
-            self.root.after(0, lambda: messagebox.showinfo("Success", 
+            self.root.after(0, lambda: messagebox.showinfo("Success",
                 f"Voice '{voice_name}' has been trained and saved to {output_file}"))
+            self.root.after(0, self.refresh_voice_lists)
             
         except Exception as e:
             error_msg = f"Error during training: {str(e)}"
@@ -527,39 +600,43 @@ class QwenTTSGUI:
             self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
     
     def generate_speech(self):
-        voice_file = self.voice_file_entry.get().strip()
         text = self.text_entry.get("1.0", tk.END).strip()
         output_format = self.output_format.get()
+        language = self.use_language_combo.get()
+        instruct = self.instruct_entry.get().strip()
 
-        if not voice_file:
-            messagebox.showerror("Error", "Please select a voice file")
+        selected = self.use_voice_combo.get()
+        voice = self.use_voice_map.get(selected)
+        if not voice:
+            messagebox.showerror("Error", "Please select a voice")
             return
+        kind, key = voice
 
         if not text:
             messagebox.showerror("Error", "Please enter text to generate")
             return
 
-        if not os.path.exists(voice_file):
-            messagebox.showerror("Error", f"Voice file not found: {voice_file}")
-            return
-
         # Run generation in a separate thread
-        thread = threading.Thread(target=self._generate_speech_thread, args=(voice_file, text, output_format))
+        thread = threading.Thread(
+            target=self._generate_speech_thread,
+            args=(kind, key, text, output_format, language, instruct)
+        )
         thread.daemon = True
         thread.start()
     
-    def _generate_speech_thread(self, voice_file, text, output_format="wav"):
+    def _generate_speech_thread(self, kind, key, text, output_format="wav", language="Auto", instruct=""):
         try:
             self.root.after(0, lambda: self.use_status_label.config(
                 text="Loading model...", foreground="blue"))
-            
+
             device_type = self.use_device_type.get()
             config = self.get_model_config(device_type, show_warning=True)
-            
+            model_repo = MODEL_REPO_CUSTOM_VOICE if kind == "preset" else MODEL_REPO_BASE
+
             # Load model
             try:
                 model = Qwen3TTSModel.from_pretrained(
-                    "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                    model_repo,
                     **config
                 )
             except (RuntimeError, torch.cuda.CudaError) as cuda_error:
@@ -576,64 +653,74 @@ class QwenTTSGUI:
                     # Retry with CPU config
                     config = self.get_model_config("cpu", show_warning=False)
                     model = Qwen3TTSModel.from_pretrained(
-                        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                        model_repo,
                         **config
                     )
                 else:
                     # Re-raise if it's not a CUDA compatibility error
                     raise
-            
-            self.root.after(0, lambda: self.use_status_label.config(
-                text="Loading voice...", foreground="blue"))
-            
-            # Allowlist the class
-            torch.serialization.add_safe_globals([VoiceClonePromptItem])
-            
-            # Load the saved voice clone prompt with proper device mapping
-            # Use map_location to handle CPU/GPU properly
-            map_location = "cpu" if device_type == "cpu" or not torch.cuda.is_available() else None
-            
-            # Check if file exists and is readable
-            if not os.path.exists(voice_file):
-                raise FileNotFoundError(f"Voice file not found: {voice_file}")
-            
-            if not voice_file.lower().endswith('.pt'):
-                raise ValueError(f"Invalid file type. Expected .pt file, got: {voice_file}")
-            
-            try:
-                # Try loading with weights_only parameter (PyTorch 2.0+)
+
+            # Custom (cloned) voices need their saved prompt loaded; presets don't —
+            # generate_custom_voice() just takes the speaker name directly.
+            prompt_items = None
+            if kind == "custom":
+                self.root.after(0, lambda: self.use_status_label.config(
+                    text="Loading voice...", foreground="blue"))
+
+                voice_file = os.path.join(OUTPUT_DIR, f"{key}.pt")
+                if not os.path.exists(voice_file):
+                    raise FileNotFoundError(f"Voice file not found: {voice_file}")
+
+                # Allowlist the class
+                torch.serialization.add_safe_globals([VoiceClonePromptItem])
+
+                # Use map_location to handle CPU/GPU properly
+                map_location = "cpu" if device_type == "cpu" or not torch.cuda.is_available() else None
+
                 try:
-                    if map_location:
-                        prompt_items = torch.load(voice_file, map_location=map_location, weights_only=False)
-                    else:
-                        prompt_items = torch.load(voice_file, weights_only=False)
-                except TypeError:
-                    # Fallback for older PyTorch versions that don't support weights_only
-                    if map_location:
-                        prompt_items = torch.load(voice_file, map_location=map_location)
-                    else:
-                        prompt_items = torch.load(voice_file)
-            except Exception as load_error:
-                # Try loading on CPU as final fallback
-                try:
-                    prompt_items = torch.load(voice_file, map_location="cpu")
-                except Exception as e:
-                    error_details = str(e)
-                    if "pickle" in error_details.lower() or "unpickling" in error_details.lower():
-                        raise Exception(f"Failed to load voice file. The file may be corrupted or incompatible. Error: {error_details}")
-                    else:
-                        raise Exception(f"Failed to load voice file '{voice_file}': {error_details}")
-            
+                    # Try loading with weights_only parameter (PyTorch 2.0+)
+                    try:
+                        if map_location:
+                            prompt_items = torch.load(voice_file, map_location=map_location, weights_only=False)
+                        else:
+                            prompt_items = torch.load(voice_file, weights_only=False)
+                    except TypeError:
+                        # Fallback for older PyTorch versions that don't support weights_only
+                        if map_location:
+                            prompt_items = torch.load(voice_file, map_location=map_location)
+                        else:
+                            prompt_items = torch.load(voice_file)
+                except Exception:
+                    # Try loading on CPU as final fallback
+                    try:
+                        prompt_items = torch.load(voice_file, map_location="cpu")
+                    except Exception as e:
+                        error_details = str(e)
+                        if "pickle" in error_details.lower() or "unpickling" in error_details.lower():
+                            raise Exception(f"Failed to load voice file. The file may be corrupted or incompatible. Error: {error_details}")
+                        else:
+                            raise Exception(f"Failed to load voice file '{voice_file}': {error_details}")
+
             self.root.after(0, lambda: self.use_status_label.config(
                 text="Generating speech...", foreground="blue"))
-            
-            # Generate speech
-            try:
-                wavs, sr = model.generate_voice_clone(
+
+            def do_generate(m):
+                if kind == "preset":
+                    return m.generate_custom_voice(
+                        text=text,
+                        speaker=key,
+                        language=language,
+                        instruct=instruct or None,
+                    )
+                return m.generate_voice_clone(
                     text=text,
-                    language="English",
+                    language=language,
                     voice_clone_prompt=prompt_items,
                 )
+
+            # Generate speech
+            try:
+                wavs, sr = do_generate(model)
             except (RuntimeError, torch.cuda.CudaError) as cuda_error:
                 # Check if it's a CUDA compatibility error during generation
                 error_str = str(cuda_error).lower()
@@ -648,40 +735,34 @@ class QwenTTSGUI:
                     # Reload model with CPU config
                     config = self.get_model_config("cpu", show_warning=False)
                     model = Qwen3TTSModel.from_pretrained(
-                        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                        model_repo,
                         **config
                     )
                     # Retry the generation
-                    wavs, sr = model.generate_voice_clone(
-                        text=text,
-                        language="English",
-                        voice_clone_prompt=prompt_items,
-                    )
+                    wavs, sr = do_generate(model)
                 else:
                     # Re-raise if it's not a CUDA compatibility error
                     raise
-            
+
             # Determine save location
             save_folder = self.use_save_entry.get().strip()
-            voice_name = os.path.splitext(os.path.basename(voice_file))[0]
-
             output_dir = save_folder if save_folder else OUTPUT_DIR
             if output_dir and not os.path.exists(output_dir):
                 os.makedirs(output_dir, exist_ok=True)
 
-            output_file = os.path.join(output_dir, f"{voice_name}_output.{output_format}")
+            output_file = os.path.join(output_dir, f"{key}_output.{output_format}")
 
             if output_format == "wav":
                 sf.write(output_file, wavs[0], sr)
             else:
                 encode_audio(wavs[0], sr, output_file, output_format)
-            
+
             self.root.after(0, lambda: self.use_status_label.config(
-                text=f"Speech generated successfully! Saved to {output_file}", 
+                text=f"Speech generated successfully! Saved to {output_file}",
                 foreground="green"))
-            self.root.after(0, lambda: messagebox.showinfo("Success", 
+            self.root.after(0, lambda: messagebox.showinfo("Success",
                 f"Speech has been generated and saved to {output_file}"))
-            
+
         except Exception as e:
             error_msg = f"Error during generation: {str(e)}"
             self.root.after(0, lambda: self.use_status_label.config(

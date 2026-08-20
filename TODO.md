@@ -5,12 +5,24 @@ currently uses. Local tracking only, not committed. Ordered roughly by bang-for-
 
 ## CustomVoice model (preset voices)
 
-- [ ] Add a way to select the `CustomVoice` checkpoint (currently the GUI only ever
-      loads `Qwen/Qwen3-TTS-12Hz-1.7B-Base`)
-- [ ] Add a "Speaker" dropdown populated from `model.get_supported_speakers()`
+Landed together with a broader voice-picker redesign: Train Voice now has a "Voice"
+dropdown ("New..." + local custom voices, no presets — they aren't trainable), and Use
+Voice's dropdown lists custom voices + the 9 presets (suffixed `(Preset)`). Selecting a
+preset loads the CustomVoice checkpoint instead of Base.
+
+- [x] Add a way to select the `CustomVoice` checkpoint (via the Use Voice dropdown,
+      resolved to `MODEL_REPO_CUSTOM_VOICE` when a preset is selected)
+- [x] Add a "Speaker" dropdown populated from `model.get_supported_speakers()` — actually
+      hardcoded (`PRESET_VOICES`) rather than fetched at runtime, see decision below
       (9 presets: Vivian, Serena, Uncle_Fu, Dylan, Eric, Ryan, Aiden, Ono_Anna, Sohee)
-- [ ] Add optional style "Instruction" text box (e.g. "say it in an angry tone")
-- [ ] Wire up to `model.generate_custom_voice(text, speaker, language, instruct=...)`
+- [x] Add optional style "Instruction" text box (e.g. "say it in an angry tone") — shown
+      only when a preset is selected
+- [x] Wire up to `model.generate_custom_voice(text, speaker, language, instruct=...)`
+
+Note: the speaker list is hardcoded, not fetched via `model.get_supported_speakers()` at
+runtime — that would require loading the CustomVoice checkpoint (or at least its config
+via `AutoConfig.from_pretrained`, network/HF-cache dependent) just to populate a dropdown
+before the user has done anything. The 9 names are fixed for this released checkpoint.
 
 ## VoiceDesign model
 
@@ -21,10 +33,12 @@ currently uses. Local tracking only, not committed. Ordered roughly by bang-for-
 
 ## Language selection
 
-- [ ] Replace hardcoded `language="English"` ([qwen_tts_gui.py:621,644](src/qwen_tts_gui.py#L621))
-      with a dropdown
-- [ ] Populate from `model.get_supported_languages()` — Auto, Chinese, English,
-      Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
+- [x] Replace hardcoded `language="English"` with a dropdown (Use Voice tab, applies to
+      both custom-voice cloning and preset generation)
+- [x] Populate from the known supported languages (`SUPPORTED_LANGUAGES` — hardcoded for
+      the same reason as the preset list above, not fetched via
+      `model.get_supported_languages()`) — Auto, Chinese, English, Japanese, Korean,
+      German, French, Russian, Portuguese, Spanish, Italian
 
 ## Voice-clone mode (x_vector_only_mode)
 
