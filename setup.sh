@@ -160,8 +160,16 @@ log "Upgrading pip ..."
 python -m pip install --upgrade pip
 
 PIN_NUMBA=0.62.1
+PIN_NUMPY=1.26.4
 
 if [[ "$INTEL_MAC" -eq 1 ]]; then
+  # torch 2.2.2 was built against NumPy 1.x's ABI and crashes on import under
+  # NumPy 2.x ("_ARRAY_API not found"). requirements.txt installs unpinned numpy,
+  # which resolves to 2.x, so this has to be pinned before anything imports torch.
+  # Installed first so later installs see it already satisfied and don't upgrade it.
+  log "Pinning numpy==${PIN_NUMPY} (torch ${PIN_TORCH} is not compatible with NumPy 2.x) ..."
+  pip install "numpy==${PIN_NUMPY}"
+
   log "Installing PyTorch ${PIN_TORCH} (last Intel-macOS build; plain PyPI, no CUDA index) ..."
   pip install "torch==${PIN_TORCH}" "torchvision==${PIN_TORCHVISION}" "torchaudio==${PIN_TORCHAUDIO}"
 
