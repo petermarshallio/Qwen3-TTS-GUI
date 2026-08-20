@@ -4,10 +4,19 @@ An intuitive GUI app for Qwen3's TTS model
 
 ## Features
 
-- **Train Voice**: Create voice clones from audio files or by recording
-- **Use Voice**: Generate speech using trained voice models
-- **Device Selection**: Choose between CUDA (GPU) or CPU for model inference
-- **User-Friendly Interface**: Clean, tabbed interface built with tkinter
+The app is built around a screenplay metaphor: you write a **script** — a
+stack of dialogue lines, each spoken by an **actor** (a voice) — and generate
+it as one audio file.
+
+- **Script canvas**: build a script as dialogue blocks (actor, optional tone,
+  the line itself), or paste a plain-text script — your own, or one written
+  by an LLM — via **Import Script**
+- **Cast sidebar**: every available actor (a preset voice, a cloned
+  recording, or a designed voice), with a play button to preview each one
+- **Casting a new actor**: bring an existing recording, record one live with
+  a guided script, or design a voice from a natural-language description
+- **Settings**: device (CUDA/CPU), and model size/dtype for training and
+  generation independently — set once, not per script
 
 ## Installation
 
@@ -171,25 +180,35 @@ python src/qwen_tts_gui.py
 
 ## How to Use
 
-### Training a Voice
+### Casting a new actor
 
-1. Go to the **Train Voice** tab
-2. Enter a name for your voice
-3. Select your preferred device (CUDA/CPU)
-4. Choose training method:
-  - **From Audio File + Transcript**: Browse for a WAV file and enter the transcript
-  - **Record Audio**: Use the built-in recorder with a pre-made script
-5. Click **Train Voice** to start training
-6. The trained voice will be saved as `{voice_name}.pt`
+1. Click **+ New Actor** in the Cast sidebar (or "+ New Actor…" from the actor
+   picker when building a script)
+2. Enter a name
+3. Choose how to give it a voice:
+   - **From Audio File + Transcript**: browse for a WAV file and enter the exact
+     transcript (or check **Quick clone** to skip the transcript, faster but lower
+     fidelity)
+   - **Record Audio**: use the built-in recorder, reading one of the offered scripts
+     aloud
+   - **Design from Description**: describe the voice in plain language (e.g. "warm
+     elderly British female voice") — no recording needed
+4. Click **Train Voice**. The actor appears in the Cast sidebar once done,
+   with a preview clip generated automatically.
 
-### Using a Trained Voice
+### Building and generating a script
 
-1. Go to the **Use Voice** tab
-2. Browse and select a trained voice file (`.pt` file)
-3. Select your preferred device (CUDA/CPU)
-4. Enter the text you want to generate
-5. Click **Generate Speech** to create the audio
-6. The output will be saved as `{voice_name}_output.wav`
+1. Click **+ Add Line**, pick an actor (or cast a new one on the spot), and
+   type their line. Repeat for as many lines/actors as the script needs —
+   presets and cloned/designed voices can be mixed freely.
+2. Optionally give a preset-voiced line a **tone** (e.g. "cheerfully") —
+   voice-clone lines don't support this.
+3. Or skip steps 1–2 and use **Import Script** to paste a plain-text script
+   instead — screenplay format: a `NAME` line (optionally `NAME (tone)`), the
+   dialogue below it, a blank line before the next actor. Works well with
+   scripts written by an LLM.
+4. Pick a Language and Output Format, then click **Generate Speech** —
+   you'll be asked where to save the result.
 
 ## Notes
 

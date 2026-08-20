@@ -1,10 +1,12 @@
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import zlib
 from datetime import datetime
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import ClassVar
@@ -13,7 +15,9 @@ import av
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
+import sv_ttk
 import torch
+from PIL import Image, ImageDraw, ImageTk
 from qwen_tts import Qwen3TTSModel
 from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
 
@@ -47,6 +51,19 @@ else:
     _base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_DIR = os.path.join(_base_dir, "local")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Cached "what does this actor sound like" clips for the Cast sidebar's play button —
+# generated proactively (right after a voice is cast, and via a startup sweep that
+# backfills anything missing, including the 9 presets) rather than on demand, so
+# clicking play is always instant rather than triggering a model load.
+PREVIEW_DIR = os.path.join(OUTPUT_DIR, "previews")
+os.makedirs(PREVIEW_DIR, exist_ok=True)
+PREVIEW_TEXT = "Hello there — this is a quick preview of my voice."
+
+
+def preview_path_for(key):
+    return os.path.join(PREVIEW_DIR, f"{key}_preview.wav")
+
 
 MODEL_SIZES = ("1.7B", "0.6B")
 MODEL_REPOS_BASE = {
@@ -97,8 +114,6 @@ SUPPORTED_LANGUAGES = [
     "Spanish",
     "Italian",
 ]
-
-NEW_VOICE_LABEL = "New..."
 
 # Read-aloud reference scripts offered on the Train Voice > Record tab, ordered
 # shortest-to-longest. "Original" is this app's very first script (kept for anyone
@@ -180,12 +195,9 @@ def list_voice_recordings(voice_name):
     )
 
 
-VOICE_MARKER_RE = re.compile(r"\[([^\[\]:]+)(?::([^\[\]]*))?\]")
-
-
 def build_voice_lookup():
-    """Bare voice name (lowercased) -> (kind, key), for resolving [VoiceName] markers.
-    Presets are added first so a same-named custom voice takes precedence."""
+    """Bare voice name (lowercased) -> (kind, key), for resolving an actor name to a
+    voice. Presets are added first so a same-named custom voice takes precedence."""
     lookup = {}
     for speaker in PRESET_VOICES:
         lookup[speaker.lower()] = ("preset", speaker)
@@ -194,62 +206,196 @@ def build_voice_lookup():
     return lookup
 
 
-def parse_voice_segments(text, lookup):
-    """Split `text` on `[VoiceName]` / `[VoiceName:instruction]` markers into ordered
-    (kind, key, segment_text, instruct) tuples. Each marker sets the active voice (and
-    instruction, if given) for everything after it until the next marker. Empty
-    segments are dropped.
+# A colored dot + name is how the script canvas and Cast sidebar show "who's talking"
+# without reading — every reference to a given actor uses the same color, for the life
+# of the process. zlib.crc32 (not the builtin hash(), which is salted per-process) so
+# the mapping is stable across runs, not just within one.
+ACTOR_PALETTE = [
+    "#4FB6D6",  # cyan
+    "#9C8FE8",  # violet
+    "#E0679E",  # magenta
+    "#5FBE8B",  # green
+    "#B0AE4A",  # olive
+    "#E0645A",  # red
+    "#E0973F",  # amber
+    "#6E93EF",  # blue
+]
 
-    Text isn't allowed before the first marker — with no dropdown fallback, there's no
-    voice to assign it to.
+
+def color_for_actor(key):
+    """Deterministic display color for actor `key` — same actor, same color, always."""
+    return ACTOR_PALETTE[zlib.crc32(key.lower().encode()) % len(ACTOR_PALETTE)]
+
+
+# sv-ttk's light theme paints the window at #fafafa and its text at #1c1c1c. THEME_FG
+# is that same foreground, for the places we set a widget's text color explicitly
+# (rather than leaving it to the ttk style) and so must match the theme by hand.
+THEME_FG = "#1c1c1c"
+# These give each script block a visibly shaded "card" surface, so a block (and the
+# text box inside it) reads as a distinct clickable area rather than blending into
+# the canvas background.
+SCRIPT_BLOCK_BG = "#eeeeee"
+SCRIPT_BLOCK_BORDER = "#c9c9c9"
+# Typewriter feel for the script itself — actor name, tone, and dialogue text all
+# share this fixed-width family. "Courier" is one of Tk's generic logical font
+# names, so it resolves to a real monospace font on any platform.
+SCRIPT_FONT_FAMILY = "Courier"
+SCRIPT_BLOCK_FOCUS_BORDER = "#005fb8"  # sv-ttk's accent color
+
+
+# --- Cast sidebar icons (play/spinner, edit, delete): drawn as small fixed-size
+# bitmaps rather than font glyphs. Text characters (▶, 🗑, ✎, and the arrows used
+# for the spinner) don't render at a consistent size across fonts/platforms —
+# notably emoji-presentation glyphs like 🗑, which come out visibly wider than
+# plain symbol glyphs at the same font size — so no font/padding tuning can make
+# a row of them look uniform. A hand-drawn bitmap has no such ambiguity: every
+# icon and every spinner frame is exactly ICON_SIZE square, always. ---
+
+ICON_SIZE = 16
+_ICON_SUPERSAMPLE = 4  # draw this many times larger, then downsample for smooth
+# (antialiased) edges — ImageDraw's own shapes are hard-edged at low resolution.
+
+
+def _icon_canvas():
+    size = ICON_SIZE * _ICON_SUPERSAMPLE
+    return Image.new("RGBA", (size, size), (0, 0, 0, 0)), size
+
+
+def _finish_icon(img):
+    return img.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
+
+
+def _draw_play_icon(color):
+    img, size = _icon_canvas()
+    draw = ImageDraw.Draw(img)
+    margin = size * 0.28
+    draw.polygon(
+        [(margin, size * 0.15), (margin, size * 0.85), (size - margin, size / 2)],
+        fill=color,
+    )
+    return _finish_icon(img)
+
+
+def _draw_edit_icon(color):
+    img, size = _icon_canvas()
+    draw = ImageDraw.Draw(img)
+    width = int(size * 0.12)
+    draw.line(
+        [(size * 0.2, size * 0.8), (size * 0.7, size * 0.3)], fill=color, width=width
+    )
+    draw.polygon(
+        [
+            (size * 0.68, size * 0.32),
+            (size * 0.85, size * 0.15),
+            (size * 0.85, size * 0.32),
+        ],
+        fill=color,
+    )
+    return _finish_icon(img)
+
+
+def _draw_delete_icon(color):
+    img, size = _icon_canvas()
+    draw = ImageDraw.Draw(img)
+    width = int(size * 0.07)
+    draw.line(
+        [(size * 0.2, size * 0.28), (size * 0.8, size * 0.28)], fill=color, width=width
+    )
+    draw.line(
+        [(size * 0.38, size * 0.16), (size * 0.62, size * 0.16)],
+        fill=color,
+        width=width,
+    )
+    draw.line(
+        [
+            (size * 0.26, size * 0.28),
+            (size * 0.3, size * 0.85),
+            (size * 0.7, size * 0.85),
+            (size * 0.74, size * 0.28),
+        ],
+        fill=color,
+        width=width,
+        joint="curve",
+    )
+    for fx in (0.4, 0.5, 0.6):
+        draw.line(
+            [(size * fx, size * 0.38), (size * fx, size * 0.75)],
+            fill=color,
+            width=width,
+        )
+    return _finish_icon(img)
+
+
+def _build_spinner_icons(color, frame_count=8):
+    """One upward arrow, rotated into `frame_count` evenly-spaced frames — rotated
+    before downsampling (not after), so every frame keeps the same antialiased
+    quality as the base drawing."""
+    img, size = _icon_canvas()
+    draw = ImageDraw.Draw(img)
+    width = int(size * 0.1)
+    cx = size / 2
+    draw.line([(cx, size * 0.8), (cx, size * 0.25)], fill=color, width=width)
+    draw.polygon(
+        [
+            (cx - size * 0.18, size * 0.35),
+            (cx + size * 0.18, size * 0.35),
+            (cx, size * 0.15),
+        ],
+        fill=color,
+    )
+    return [
+        _finish_icon(img.rotate(-i * (360 / frame_count), resample=Image.BICUBIC))
+        for i in range(frame_count)
+    ]
+
+
+# Screenplay-format headers: "NAME" or "NAME (tone)".
+_SCREENPLAY_HEADER_RE = re.compile(r"^([^(]+?)(?:\s*\(([^)]*)\))?$")
+
+
+def parse_screenplay_text(text, lookup):
+    """Parse a pasted plain-text script — screenplay format: a NAME (optionally
+    "NAME (tone)"), one or more lines of dialogue, a blank line before the next
+    actor — into the same `{"kind", "key", "tone", "text"}` shape the block editor
+    produces, so an imported script drops straight into `self.script_lines`.
+
+    This is the format an LLM naturally writes a script in when asked to, and reads
+    naturally to a person too — no bracket-marker syntax to learn.
 
     Returns:
-        (segments, errors, warnings). `errors` block generation (unknown voice names,
-        text with no voice assigned) — join and show, don't generate. `warnings` don't
-        (an instruction given for a voice-clone voice, which has no instruct concept
-        and will just be ignored) — show, then generate anyway.
+        (lines, errors). `errors` lists any actor name that doesn't resolve via
+        `lookup` — import is blocked on any error, the same way the block editor is
+        implicitly protected (it can only ever reference a real actor, being
+        picker-driven).
     """
-    segments = []
+    lines = []
     errors = []
-    warnings = []
-    voice = None
-    instruct = ""
-    pos = 0
-    for match in VOICE_MARKER_RE.finditer(text):
-        chunk = text[pos : match.start()].strip()
-        if chunk:
-            if voice is None:
-                errors.append(
-                    f'Text before the first [Voice] marker has no voice assigned: "{chunk}"'
-                )
-            else:
-                segments.append((voice[0], voice[1], chunk, instruct))
+    for block in re.split(r"\n\s*\n", text.strip()):
+        block = block.strip()
+        if not block:
+            continue
+        block_lines = block.splitlines()
+        header = block_lines[0].strip()
+        dialogue = "\n".join(line.strip() for line in block_lines[1:]).strip()
+
+        match = _SCREENPLAY_HEADER_RE.match(header)
+        if not match:
+            errors.append(f'Could not read speaker line: "{header}"')
+            continue
 
         name = match.group(1).strip()
-        marker_instruct = (match.group(2) or "").strip()
+        tone = (match.group(2) or "").strip()
         resolved = lookup.get(name.lower())
         if resolved is None:
-            errors.append(f"Unknown voice: [{name}]")
-        else:
-            voice = resolved
-            instruct = marker_instruct
-            if instruct and voice[0] == "custom":
-                warnings.append(
-                    f'"{name}" is a voice clone — instructions only work with preset '
-                    f"voices, so [{name}:{marker_instruct}] will be generated without one."
-                )
-        pos = match.end()
+            errors.append(f"Unknown actor: {name}")
+            continue
+        if not dialogue:
+            continue
 
-    chunk = text[pos:].strip()
-    if chunk:
-        if voice is None:
-            errors.append(
-                f'Text before the first [Voice] marker has no voice assigned: "{chunk}"'
-            )
-        else:
-            segments.append((voice[0], voice[1], chunk, instruct))
+        kind, key = resolved
+        lines.append({"kind": kind, "key": key, "tone": tone, "text": dialogue})
 
-    return segments, errors, warnings
+    return lines, errors
 
 
 def group_segments_by_kind(segments):
@@ -447,11 +593,89 @@ class CollapsibleSection:
         self.header.pack(**kwargs)
 
 
+class ScrollableFrame:
+    """A vertically-scrolling Frame — Tkinter has no built-in one. The standard
+    recipe: a Canvas + Scrollbar, with an inner Frame (`self.body`) placed on the
+    canvas; widgets are packed into `body` exactly as they would be into any other
+    Frame. Backs both the Cast sidebar and the script canvas."""
+
+    def __init__(self, parent):
+        self.outer = ttk.Frame(parent)
+        self.canvas = tk.Canvas(self.outer, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(
+            self.outer, orient=tk.VERTICAL, command=self.canvas.yview
+        )
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.body = ttk.Frame(self.canvas)
+        self._body_id = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
+
+        self.body.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")),
+        )
+        self.canvas.bind(
+            "<Configure>",
+            lambda e: self.canvas.itemconfigure(self._body_id, width=e.width),
+        )
+        # Bound directly on canvas + body (not via bind_all on Enter/Leave — Tk fires
+        # <Leave> on the canvas the instant the pointer crosses onto any child widget
+        # stacked on top of it, which would silently kill scrolling over almost
+        # everything, and bind_all from two simultaneously-visible ScrollableFrames
+        # would fight over the same global binding).
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.body.bind("<MouseWheel>", self._on_mousewheel)
+
+    def bind_scroll(self, widget):
+        """Opt a widget — and, recursively, every descendant it already has — into
+        scrolling this frame directly. Call on a row/block's outer Frame after all
+        of its children are built, so scrolling works with the pointer anywhere over
+        the row (its labels, buttons, entries, text), not just gaps between them."""
+        widget.bind("<MouseWheel>", self._on_mousewheel, add="+")
+        for child in widget.winfo_children():
+            self.bind_scroll(child)
+
+    def _on_mousewheel(self, event):
+        # macOS reports delta already in small per-notch units; Windows reports it in
+        # multiples of 120 — dividing by 120 on macOS would round almost every
+        # scroll down to zero.
+        amount = event.delta if sys.platform == "darwin" else event.delta / 120
+        self.canvas.yview_scroll(int(-1 * amount), "units")
+
+    def pack(self, **kwargs):
+        self.outer.pack(**kwargs)
+
+
 class QwenTTSGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Qwen3 TTS Voice Training & Generation")
-        self.root.geometry("800x1000")
+        self.root.title("Studio — Qwen3 TTS")
+        self.root.geometry("1280x860")
+        self.root.minsize(960, 600)
+
+        # "Block.*" styles give a script block's Frame/Label/Entry a matching lighter
+        # background (SCRIPT_BLOCK_BG) — each unspecified option (font, foreground,
+        # etc.) falls back to its base TFrame/TLabel/TEntry default since ttk treats
+        # an unregistered "Block.TWidget" name as a variant of TWidget.
+        style = ttk.Style()
+        style.configure("Block.TFrame", background=SCRIPT_BLOCK_BG)
+        style.configure("Block.TLabel", background=SCRIPT_BLOCK_BG)
+        style.configure("Block.TEntry", fieldbackground=SCRIPT_BLOCK_BG)
+        # Small, square-ish footprint for the Cast sidebar's per-row icon buttons —
+        # the default TButton padding is sized for text labels, not a 16x16 image.
+        style.configure("Icon.TButton", padding=3)
+
+        # Built once a real Tk root exists (ImageTk.PhotoImage needs one) and kept
+        # referenced on self for the widgets' lifetime — Tk drops an image the
+        # instant nothing still refers to its PhotoImage.
+        self.icon_play = ImageTk.PhotoImage(_draw_play_icon(THEME_FG))
+        self.icon_edit = ImageTk.PhotoImage(_draw_edit_icon(THEME_FG))
+        self.icon_delete = ImageTk.PhotoImage(_draw_delete_icon(THEME_FG))
+        self.icon_spinner_frames = [
+            ImageTk.PhotoImage(frame) for frame in _build_spinner_icons(THEME_FG)
+        ]
 
         self.device_type = tk.StringVar(value="cuda")
         default_dtype = "bfloat16" if torch.cuda.is_available() else "float32"
@@ -464,20 +688,52 @@ class QwenTTSGUI:
         self.recording_map = {}  # filename -> full path, for the current voice's takes
         self.generate_cancel_event = threading.Event()
 
-        self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # The script: an ordered list of {"kind", "key", "tone", "text"} dicts, one
+        # per dialogue block. Generation converts this straight into the
+        # (kind, key, text, instruct) tuples _generate_speech_thread already expects
+        # — no text parsing needed for anything built through the block editor.
+        self.script_lines = []
+        # Set only while the New Actor dialog was opened *from* the actor picker (so
+        # the freshly cast actor gets selected into whichever line asked for it),
+        # rather than from the Cast sidebar's own "+ New Actor" button.
+        self._new_actor_on_created = None
+        # None in "new actor" mode; the actor's current name in "edit" mode (opened
+        # via edit_voice) — train_voice checks this to allow retraining under the
+        # same name without a collision error, and to rename-on-disk rather than
+        # just create a second voice if the name's changed instead.
+        self._editing_voice_key = None
 
-        self.train_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.train_frame, text="Train Voice")
-        self.setup_train_tab()
+        # Cast sidebar play buttons awaiting a preview show a rotating arrow instead
+        # of ▶ (and are disabled meanwhile) — refresh_cast_sidebar repopulates this
+        # list each time it rebuilds the rows; this just keeps every currently-shown
+        # one animated in lockstep.
+        self._preview_spinner_frame = 0
+        self._preview_spinner_buttons = []
+        self._tick_preview_spinner()
 
-        self.use_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.use_frame, text="Use Voice")
-        self.setup_use_tab()
+        self.build_top_bar(self.root)
 
-        self.configure_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.configure_frame, text="Configure")
-        self.setup_configure_tab()
+        body = ttk.Frame(self.root)
+        body.pack(fill=tk.BOTH, expand=True)
+        self.build_cast_sidebar(body)
+
+        # Both the script canvas and the generation bar live in this frame, so
+        # set_use_busy's _set_frame_enabled(self.use_frame, ...) disables the whole
+        # right-hand side (not the Cast sidebar) while a generation is in flight.
+        self.use_frame = ttk.Frame(body)
+        self.use_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.build_script_canvas(self.use_frame)
+        self.build_generation_bar(self.use_frame)
+
+        # Built once and shown/hidden (not torn down and rebuilt) on every open.
+        self.build_new_actor_dialog()
+        self.build_settings_dialog()
+        self.build_import_dialog()
+
+        self.refresh_cast_sidebar()
+        # Backfill any voice (including the 9 presets, on first-ever run) missing a
+        # cached preview, without delaying the window itself appearing.
+        threading.Thread(target=self.sweep_missing_previews, daemon=True).start()
 
     # --- Placeholder text + live counters, shared by the Transcript / Text to
     # Generate / Instruction boxes ---
@@ -491,7 +747,7 @@ class QwenTTSGUI:
         def on_focus_in(event):
             if widget.showing_placeholder:
                 widget.delete("1.0", tk.END)
-                widget.config(foreground="black")
+                widget.config(foreground=THEME_FG)
                 widget.showing_placeholder = False
 
         def on_focus_out(event):
@@ -512,7 +768,7 @@ class QwenTTSGUI:
         def on_focus_in(event):
             if widget.showing_placeholder:
                 widget.delete(0, tk.END)
-                widget.config(foreground="black")
+                widget.config(foreground=THEME_FG)
                 widget.showing_placeholder = False
 
         def on_focus_out(event):
@@ -550,154 +806,40 @@ class QwenTTSGUI:
         widget.bind("<FocusOut>", lambda e: widget.after(1, update), add="+")
         update()
 
-    # --- [VoiceName] autocomplete: pop up a filtered voice list when '[' is typed in
-    # a text widget, so marker names don't have to be memorized/typed by hand. ---
+    # --- Actor picker: a native dropdown menu for choosing an existing actor (or
+    # casting a new one) for a script line, posted at whatever widget was clicked.
+    # No type-to-filter search box — a tk.Menu can't embed one — but arrow keys and
+    # first-letter jumps (both native menu behavior) cover a cast this small. ---
 
-    def setup_voice_autocomplete(self, text_widget):
-        """Bind `text_widget` so typing '[' opens a filtered voice-name popup.
-        Enter/Tab/click on a match inserts 'Name]' — cursor landing just before the
-        ']' so an optional ':instruction' can follow — and closes the popup. Escape,
-        clicking elsewhere, losing focus, or confirming with no match selected are all
-        *abandoned* closes — they erase the dangling '[' + partial name so it doesn't
-        linger as noise. Typing ']' or ':' by hand means the marker (or its name) was
-        typed without the popup's help, so that text is left exactly as typed."""
-        state = {"popup": None, "listbox": None, "names": []}
-        MARK = "voice_ac_start"
+    def open_actor_picker(self, anchor_widget, on_pick):
+        """Post a dropdown menu of every actor below `anchor_widget`.
 
-        def close_popup(abandoned=False):
-            if state["popup"] is None:
-                return
-            if (
-                abandoned
-                and MARK in text_widget.mark_names()
-                and text_widget.compare("insert", ">=", MARK)
-            ):
-                text_widget.delete(MARK, "insert")
-            state["popup"].destroy()
-            state["popup"] = None
-            state["listbox"] = None
-            if MARK in text_widget.mark_names():
-                text_widget.mark_unset(MARK)
+        Args:
+            anchor_widget: The widget the menu positions itself under.
+            on_pick: Called with (kind, key) once an actor is chosen — either an
+                existing one, or a freshly cast one (via "+ New Actor", which reopens
+                the New Actor dialog and calls this once training succeeds).
+        """
+        lookup = build_voice_lookup()
+        actors = sorted({v for v in lookup.values()}, key=lambda kv: kv[1].lower())
 
-        def current_filter():
-            return text_widget.get(f"{MARK}+1c", "insert")
-
-        def refresh_listbox():
-            filter_text = current_filter().strip().lower()
-            matches = [
-                n for n in state["names"] if n.lower().startswith(filter_text)
-            ] or [n for n in state["names"] if filter_text in n.lower()]
-            listbox = state["listbox"]
-            listbox.delete(0, tk.END)
-            for name in matches:
-                listbox.insert(tk.END, name)
-            if matches:
-                listbox.selection_set(0)
-
-        def confirm_selection():
-            listbox = state["listbox"]
-            if not listbox or not listbox.curselection():
-                close_popup(abandoned=True)
-                return
-            name = listbox.get(listbox.curselection()[0])
-            text_widget.delete(f"{MARK}+1c", "insert")
-            text_widget.insert("insert", f"{name}]")
-            # Land the cursor between the name and ']', so an optional ":instruction"
-            # can be typed right away without deleting/retyping the closing bracket.
-            text_widget.mark_set("insert", "insert - 1c")
-            close_popup()
-
-        def move_selection(delta):
-            listbox = state["listbox"]
-            if not listbox or listbox.size() == 0:
-                return
-            current = listbox.curselection()
-            idx = current[0] if current else 0
-            idx = max(0, min(listbox.size() - 1, idx + delta))
-            listbox.selection_clear(0, tk.END)
-            listbox.selection_set(idx)
-            listbox.see(idx)
-
-        def open_popup():
-            text_widget.mark_set(MARK, "insert - 1c")
-            text_widget.mark_gravity(MARK, tk.LEFT)
-
-            names = sorted({name for _, name in build_voice_lookup().values()})
-            state["names"] = names
-            width = max((len(n) for n in names), default=10) + 2
-
-            popup = tk.Toplevel(text_widget)
-            popup.wm_overrideredirect(True)
-            popup.wm_attributes("-topmost", True)
-            # Padding keeps text clear of the native floating panel's rounded
-            # corners, which otherwise visually clip the first/last row.
-            frame = tk.Frame(popup, borderwidth=1, relief=tk.SOLID)
-            frame.pack(padx=1, pady=1)
-            listbox = tk.Listbox(
-                frame,
-                height=6,
-                width=width,
-                exportselection=False,
-                highlightthickness=0,
-                borderwidth=0,
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(
+            label="+ New Actor…",
+            command=lambda: self.open_new_actor_dialog(on_created=on_pick),
+        )
+        menu.add_separator()
+        for kind, key in actors:
+            menu.add_command(
+                label=key, command=lambda kind=kind, key=key: on_pick(kind, key)
             )
-            listbox.pack(padx=4, pady=4)
-            listbox.bind("<ButtonRelease-1>", lambda e: confirm_selection())
-            state["popup"] = popup
-            state["listbox"] = listbox
 
-            bbox = text_widget.bbox("insert")
-            if bbox:
-                x, y, _, h = bbox
-                popup.wm_geometry(
-                    f"+{text_widget.winfo_rootx() + x}+{text_widget.winfo_rooty() + y + h}"
-                )
-            refresh_listbox()
-
-        def on_key_release(event):
-            if state["popup"] is None:
-                if event.char == "[":
-                    open_popup()
-                return
-            if event.keysym == "Escape":
-                close_popup(abandoned=True)
-                return
-            if event.keysym in ("Down", "Up", "Return", "Tab"):
-                # Already fully handled in on_key_press (with "break"). Falling through
-                # to refresh_listbox() below would re-select index 0 on every arrow
-                # press, undoing the move_selection() that just ran.
-                return
-            filter_text = current_filter()
-            if "]" in filter_text or ":" in filter_text:
-                # Typed a complete marker, or moved on to typing ":instruction" by
-                # hand — leave it as-is either way.
-                close_popup()
-                return
-            if "\n" in filter_text or text_widget.compare("insert", "<=", MARK):
-                # Newline (e.g. pasted text) or the cursor moved back onto/before the
-                # marker (e.g. backspaced past it) — nothing coherent to keep filtering.
-                close_popup(abandoned=True)
-                return
-            refresh_listbox()
-
-        def on_key_press(event):
-            if state["popup"] is None:
-                return None
-            if event.keysym == "Down":
-                move_selection(1)
-                return "break"
-            if event.keysym == "Up":
-                move_selection(-1)
-                return "break"
-            if event.keysym in ("Return", "Tab"):
-                confirm_selection()
-                return "break"
-            return None
-
-        text_widget.bind("<KeyRelease>", on_key_release, add="+")
-        text_widget.bind("<KeyPress>", on_key_press, add="+")
-        text_widget.bind("<Button-1>", lambda e: close_popup(abandoned=True), add="+")
-        text_widget.bind("<FocusOut>", lambda e: close_popup(abandoned=True), add="+")
+        x = anchor_widget.winfo_rootx()
+        y = anchor_widget.winfo_rooty() + anchor_widget.winfo_height()
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
 
     # --- Busy state: disable every control on the tab + show a spinner while a
     # background thread is running. The library gives no generation-progress hook
@@ -726,10 +868,6 @@ class QwenTTSGUI:
 
         self._set_frame_enabled(self.train_frame, not busy)
         self.train_button.config(text="Training..." if busy else "Train Voice")
-        if not busy and self.train_voice_combo.get() != NEW_VOICE_LABEL:
-            # Voice Name must stay disabled (auto-filled) when updating an existing
-            # voice — re-set just the state, without touching its content.
-            self.voice_name_entry.config(state=tk.DISABLED)
 
     def set_use_busy(self, busy):
         # Steps are set by generate_speech() before this is called with busy=True —
@@ -785,22 +923,23 @@ class QwenTTSGUI:
         ttk.Button(dialog, text="OK", command=dialog.destroy).pack(pady=(0, 20))
         dialog.grab_set()
 
-    def setup_train_tab(self):
-        title_label = ttk.Label(
-            self.train_frame, text="Train a New Voice", font=("Arial", 16, "bold")
-        )
-        title_label.pack(pady=10)
+    def build_new_actor_dialog(self):
+        """Builds the "Cast a New Actor" dialog once, hidden until
+        `open_new_actor_dialog` deiconifies it."""
+        self.new_actor_window = tk.Toplevel(self.root)
+        self.new_actor_window.title("Cast a New Actor")
+        self.new_actor_window.geometry("560x780")
+        self.new_actor_window.withdraw()
+        self.new_actor_window.transient(self.root)
+        self.new_actor_window.protocol("WM_DELETE_WINDOW", self.close_new_actor_dialog)
 
-        # Voice picker: "New..." to create a voice, or an existing custom voice to
-        # re-train/overwrite it. Presets aren't shown here — they aren't trainable.
-        voice_frame = ttk.Frame(self.train_frame)
-        voice_frame.pack(fill=tk.X, padx=20, pady=10)
-        ttk.Label(voice_frame, text="Voice:").pack(side=tk.LEFT, padx=5)
-        self.train_voice_combo = ttk.Combobox(voice_frame, width=27, state="readonly")
-        self.train_voice_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        self.train_voice_combo.bind(
-            "<<ComboboxSelected>>", lambda e: self.on_train_voice_selected()
+        self.train_frame = ttk.Frame(self.new_actor_window)
+        self.train_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.new_actor_title_label = ttk.Label(
+            self.train_frame, text="Cast a New Actor", font=("Arial", 16, "bold")
         )
+        self.new_actor_title_label.pack(pady=10)
 
         name_frame = ttk.Frame(self.train_frame)
         name_frame.pack(fill=tk.X, padx=20, pady=10)
@@ -955,10 +1094,57 @@ class QwenTTSGUI:
             command=self.train_voice,
             style="Accent.TButton",
         )
-        self.train_button.pack(pady=20)
+        self.train_button.pack(pady=(20, 5))
+        ttk.Button(
+            self.train_frame, text="Close", command=self.close_new_actor_dialog
+        ).pack(pady=(0, 15))
 
         self.update_train_method_visibility()
-        self.refresh_train_voice_list()
+
+    def open_new_actor_dialog(self, on_created=None, prefill_name=None):
+        """Show the New Actor dialog, reset to a blank "new actor" form — or, for
+        `edit_voice`, into "edit" mode: name pre-filled and title updated to say
+        so, `self._editing_voice_key` set for `train_voice` to check. Nothing else
+        should carry over from whatever was last open in this dialog.
+
+        Args:
+            on_created: If given, called with (kind, key) once training succeeds —
+                for the actor picker's "+ New Actor" path, so the freshly cast actor
+                gets selected into whichever line asked for it.
+            prefill_name: If given, pre-filled into Voice Name and treated as an
+                edit of that actor (still a plain editable Entry — typing a
+                different name renames it rather than editing in place).
+        """
+        self._new_actor_on_created = on_created
+        self._editing_voice_key = prefill_name or None
+        self.voice_name_entry.delete(0, tk.END)
+        if prefill_name:
+            self.voice_name_entry.insert(0, prefill_name)
+        title = f'Edit "{prefill_name}"' if prefill_name else "Cast a New Actor"
+        self.new_actor_window.title(title)
+        self.new_actor_title_label.config(text=title)
+        self.refresh_recording_list()
+        self.new_actor_window.deiconify()
+        self.new_actor_window.lift()
+        self.new_actor_window.focus_set()
+        # Modal: the dialog holds the one pending `_new_actor_on_created` callback,
+        # so a second picker's "+ New Actor" (or the Cast sidebar's own button)
+        # can't reach it and silently overwrite/drop it while this is open.
+        self.new_actor_window.grab_set()
+
+    def close_new_actor_dialog(self):
+        self.new_actor_window.grab_release()
+        self._new_actor_on_created = None
+        self._editing_voice_key = None
+        self.new_actor_window.withdraw()
+
+    def _finish_new_actor_dialog(self, voice_name, on_created):
+        """Close the dialog after a successful train, and — if it was opened via
+        the actor picker's "+ New Actor" path rather than the Cast sidebar's own
+        button — select the freshly cast actor into whichever line asked for it."""
+        self.close_new_actor_dialog()
+        if on_created is not None:
+            on_created("custom", voice_name)
 
     def on_script_selected(self):
         """Refresh the read-only preview to match the picked training script."""
@@ -984,27 +1170,6 @@ class QwenTTSGUI:
             fill=tk.X, padx=20, pady=10, before=self.train_status_label
         )
 
-    def refresh_train_voice_list(self):
-        """Repopulate the Train tab's voice picker from the local voice cache."""
-        current = self.train_voice_combo.get()
-        values = [NEW_VOICE_LABEL] + list_custom_voices()
-        self.train_voice_combo["values"] = values
-        if current in values:
-            self.train_voice_combo.set(current)
-        else:
-            self.train_voice_combo.set(NEW_VOICE_LABEL)
-        self.on_train_voice_selected()
-
-    def on_train_voice_selected(self):
-        """Editable+empty for a new voice; disabled+filled for an existing one (update flow)."""
-        selected = self.train_voice_combo.get()
-        self.voice_name_entry.config(state=tk.NORMAL)
-        self.voice_name_entry.delete(0, tk.END)
-        if selected != NEW_VOICE_LABEL:
-            self.voice_name_entry.insert(0, selected)
-            self.voice_name_entry.config(state=tk.DISABLED)
-        self.refresh_recording_list()
-
     def refresh_recording_list(self):
         """Repopulate the "Take to use" picker for the current Voice Name. Called
         whenever that name changes, and after every new recording (which always
@@ -1023,91 +1188,61 @@ class QwenTTSGUI:
             self.recording_combo.config(state="disabled")
 
     def refresh_voice_lists(self):
-        """Repopulate the Train tab's voice picker — called after a voice is
-        (re-)trained so it shows up immediately without restarting the app. The Use
-        tab has no voice picker of its own: voices are resolved live from
-        `build_voice_lookup()` when [VoiceName] markers are parsed at generate time."""
-        self.refresh_train_voice_list()
+        """Repopulate the Cast sidebar — called after a voice is (re-)trained or
+        deleted, so it shows up immediately without restarting the app."""
+        self.refresh_cast_sidebar()
 
-    def setup_use_tab(self):
-        title_label = ttk.Label(
-            self.use_frame,
-            text="Generate Speech from a pretrained Voice",
-            font=("Arial", 16, "bold"),
-        )
-        title_label.pack(pady=10)
+    def build_generation_bar(self, parent):
+        """Bottom bar under the script canvas: Language, Output Format, Advanced
+        sampling controls, Generate/Cancel, and the progress panel."""
+        bar = ttk.Frame(parent)
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Separator(bar, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
-        language_frame = ttk.LabelFrame(self.use_frame, text="Language", padding=10)
-        language_frame.pack(fill=tk.X, padx=20, pady=10)
+        controls_row = ttk.Frame(bar)
+        controls_row.pack(fill=tk.X, padx=20, pady=(12, 4))
+
+        ttk.Label(controls_row, text="Language:").pack(side=tk.LEFT, padx=(0, 5))
         self.use_language_combo = ttk.Combobox(
-            language_frame, width=37, state="readonly", values=SUPPORTED_LANGUAGES
+            controls_row, width=12, state="readonly", values=SUPPORTED_LANGUAGES
         )
         self.use_language_combo.set("Auto")
-        self.use_language_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        self.use_language_combo.pack(side=tk.LEFT, padx=(0, 18))
 
-        text_frame = ttk.LabelFrame(self.use_frame, text="Text to Generate", padding=10)
-        text_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
-
-        ttk.Label(
-            text_frame,
-            text="Every generation starts with a [VoiceName] or "
-            "[VoiceName:instruction] marker — try typing '['.",
-            foreground="gray",
-        ).pack(anchor=tk.W, pady=(0, 5))
-
-        self.text_entry = scrolledtext.ScrolledText(
-            text_frame, height=8, width=50, wrap=tk.WORD
-        )
-        self.text_entry.pack(fill=tk.BOTH, expand=True)
-        self.add_placeholder_text(self.text_entry, "Enter text to synthesize...")
-        self.text_counter_label = ttk.Label(text_frame, text="", foreground="gray")
-        self.text_counter_label.pack(anchor=tk.E)
-        self.bind_text_counter(self.text_entry, self.text_counter_label)
-        self.setup_voice_autocomplete(self.text_entry)
-
-        format_frame = ttk.LabelFrame(self.use_frame, text="Output Format", padding=10)
-        format_frame.pack(fill=tk.X, padx=20, pady=10)
-
+        ttk.Label(controls_row, text="Format:").pack(side=tk.LEFT, padx=(0, 5))
         self.output_format = tk.StringVar(value="wav")
-        ttk.Radiobutton(
-            format_frame, text="WAV", variable=self.output_format, value="wav"
-        ).pack(side=tk.LEFT, padx=10)
-        ttk.Radiobutton(
-            format_frame, text="MP3", variable=self.output_format, value="mp3"
-        ).pack(side=tk.LEFT, padx=10)
-        ttk.Radiobutton(
-            format_frame, text="M4A", variable=self.output_format, value="m4a"
-        ).pack(side=tk.LEFT, padx=10)
-
-        self.use_status_label = ttk.Label(self.use_frame, text="", foreground="blue")
-        self.use_status_label.pack(pady=10)
-
-        self.use_progress_panel = ProgressPanel(self.use_frame)
-        # Not shown here — shown only while generation is in progress (set_use_busy).
+        for fmt in ("wav", "mp3", "m4a"):
+            ttk.Radiobutton(
+                controls_row, text=fmt.upper(), variable=self.output_format, value=fmt
+            ).pack(side=tk.LEFT, padx=4)
 
         # Generate opens a native Save As dialog (pre-filled with a dated default
         # filename) before starting, rather than writing to a persistent folder path.
         self.last_save_dir = OUTPUT_DIR
-        generate_button_frame = ttk.Frame(self.use_frame)
-        generate_button_frame.pack(pady=20)
-        self.generate_button = ttk.Button(
-            generate_button_frame,
-            text="Generate Speech",
-            command=self.generate_speech,
-            style="Accent.TButton",
-        )
-        self.generate_button.pack(side=tk.LEFT, padx=(0, 10))
         self.cancel_button = ttk.Button(
-            generate_button_frame,
+            controls_row,
             text="Cancel",
             command=self.cancel_generation,
             state=tk.DISABLED,
         )
-        self.cancel_button.pack(side=tk.LEFT)
+        self.cancel_button.pack(side=tk.RIGHT)
+        self.generate_button = ttk.Button(
+            controls_row,
+            text="Generate Speech",
+            command=self.generate_speech,
+            style="Accent.TButton",
+        )
+        self.generate_button.pack(side=tk.RIGHT, padx=(0, 10))
 
-        self._setup_advanced_generation_section()
+        self._setup_advanced_generation_section(bar)
 
-    def _setup_advanced_generation_section(self):
+        self.use_status_label = ttk.Label(bar, text="", foreground="blue")
+        self.use_status_label.pack(padx=20, pady=(0, 4), anchor=tk.W)
+
+        self.use_progress_panel = ProgressPanel(bar)
+        # Not shown here — shown only while generation is in progress (set_use_busy).
+
+    def _setup_advanced_generation_section(self, parent):
         """Collapsed by default; values default to the library's own hard defaults
         (qwen_tts's `_merge_generate_kwargs`), so leaving this closed generates
         identically to before it existed. subtalker_* variants are confirmed relevant
@@ -1125,7 +1260,7 @@ class QwenTTSGUI:
         self.adv_subtalker_top_p = tk.DoubleVar(value=1.0)
         self.adv_subtalker_temperature = tk.DoubleVar(value=0.9)
 
-        section = CollapsibleSection(self.use_frame, "Advanced (sampling controls)")
+        section = CollapsibleSection(parent, "Advanced (sampling controls)")
         section.pack(fill=tk.X, padx=20, pady=(0, 10))
         body = section.body
 
@@ -1189,13 +1324,24 @@ class QwenTTSGUI:
             "subtalker_temperature": self.adv_subtalker_temperature.get(),
         }
 
-    def setup_configure_tab(self):
-        """Settings you'd set once for this machine, rather than per-run choices
-        repeated on every tab: a Global section (just Device — a fact about the
-        hardware, not a per-flow tradeoff), then Train and Generate sections for
-        settings where the two flows might reasonably want different tradeoffs
-        (a bigger/slower model for a voice you're keeping forever, a smaller/faster
-        one for quick generation previews)."""
+    def build_settings_dialog(self):
+        """Builds the Settings dialog once, hidden until `open_settings_dialog`
+        deiconifies it — opened from a gear icon rather than a tab. Settings you'd
+        set once for this machine, rather than per-run choices: a Global section
+        (just Device — a fact about the hardware, not a per-flow tradeoff), then
+        Train and Generate sections for settings where the two flows might reasonably
+        want different tradeoffs (a bigger/slower model for a voice you're keeping
+        forever, a smaller/faster one for quick generation previews)."""
+        self.settings_window = tk.Toplevel(self.root)
+        self.settings_window.title("Settings")
+        self.settings_window.geometry("480x560")
+        self.settings_window.withdraw()
+        self.settings_window.transient(self.root)
+        self.settings_window.protocol("WM_DELETE_WINDOW", self.close_settings_dialog)
+
+        self.configure_frame = ttk.Frame(self.settings_window)
+        self.configure_frame.pack(fill=tk.BOTH, expand=True)
+
         title_label = ttk.Label(
             self.configure_frame, text="Configuration", font=("Arial", 16, "bold")
         )
@@ -1246,6 +1392,20 @@ class QwenTTSGUI:
             "write", lambda *_args: self._update_dtype_availability()
         )
 
+        ttk.Button(
+            self.configure_frame, text="Done", command=self.close_settings_dialog
+        ).pack(pady=20)
+
+    def open_settings_dialog(self):
+        self.settings_window.deiconify()
+        self.settings_window.lift()
+        self.settings_window.focus_set()
+        self.settings_window.grab_set()
+
+    def close_settings_dialog(self):
+        self.settings_window.grab_release()
+        self.settings_window.withdraw()
+
     def _setup_model_settings_section(self, parent, title, model_size_var, dtype_var):
         """Model size + dtype radios, shared layout for the Train/Generate sections."""
         frame = ttk.LabelFrame(parent, text=title, padding=10)
@@ -1281,6 +1441,489 @@ class QwenTTSGUI:
             self._set_frame_enabled(dtype_frame, cuda_selected)
             if not cuda_selected:
                 dtype_var.set("float32")
+
+    # --- Top bar: wordmark, script import, settings. ---
+
+    def build_top_bar(self, parent):
+        bar = ttk.Frame(parent)
+        bar.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(bar, text="STUDIO", font=("Arial", 14, "bold")).pack(
+            side=tk.LEFT, padx=(15, 20), pady=10
+        )
+        ttk.Button(bar, text="⚙ Settings", command=self.open_settings_dialog).pack(
+            side=tk.RIGHT, padx=(0, 15), pady=10
+        )
+        ttk.Button(bar, text="Import Script", command=self.open_import_dialog).pack(
+            side=tk.RIGHT, padx=(0, 8), pady=10
+        )
+
+        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X)
+
+    # --- Cast sidebar: every available actor (preset, cloned, or designed voice),
+    # with a play-to-preview button and a way to cast a new one. ---
+
+    def build_cast_sidebar(self, parent):
+        sidebar = ttk.Frame(parent, width=230)
+        sidebar.pack(side=tk.LEFT, fill=tk.Y)
+        sidebar.pack_propagate(False)
+
+        self.cast_header_label = ttk.Label(
+            sidebar, text="CAST", font=("Arial", 10, "bold")
+        )
+        self.cast_header_label.pack(anchor=tk.W, padx=14, pady=(14, 8))
+
+        ttk.Button(
+            sidebar,
+            text="+ New Actor",
+            style="Accent.TButton",
+            command=lambda: self.open_new_actor_dialog(),
+        ).pack(fill=tk.X, padx=12, pady=(0, 10))
+
+        self.cast_scroll = ScrollableFrame(sidebar)
+        self.cast_scroll.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 10))
+
+    def _tick_preview_spinner(self):
+        """Advance every pending Cast sidebar button to the next spinner frame,
+        forever — a no-op whenever nothing is pending. Simpler than starting/
+        stopping the animation loop to match, and cheap when idle."""
+        self._preview_spinner_frame = (self._preview_spinner_frame + 1) % len(
+            self.icon_spinner_frames
+        )
+        frame = self.icon_spinner_frames[self._preview_spinner_frame]
+        for button in self._preview_spinner_buttons:
+            if button.winfo_exists():
+                button.config(image=frame)
+        self.root.after(150, self._tick_preview_spinner)
+
+    def refresh_cast_sidebar(self):
+        """Rebuild the Cast list from `build_voice_lookup()` — called on startup and
+        whenever a voice is (re-)trained or deleted."""
+        for child in self.cast_scroll.body.winfo_children():
+            child.destroy()
+        self._preview_spinner_buttons = []
+
+        lookup = build_voice_lookup()
+        actors = sorted({v for v in lookup.values()}, key=lambda kv: kv[1].lower())
+        self.cast_header_label.config(text=f"CAST · {len(actors)}")
+
+        for kind, key in actors:
+            color = color_for_actor(key)
+            row = ttk.Frame(self.cast_scroll.body)
+            row.pack(fill=tk.X, pady=3, padx=4)
+
+            ttk.Label(row, text="●", foreground=color).pack(side=tk.LEFT, padx=(4, 8))
+
+            info = ttk.Frame(row)
+            info.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            ttk.Label(info, text=key, font=("Arial", 10, "bold")).pack(anchor=tk.W)
+            badge = "PRESET" if kind == "preset" else "CLONED"
+            ttk.Label(info, text=badge, foreground=color, font=("Arial", 8)).pack(
+                anchor=tk.W
+            )
+
+            # Play (or its spinner) is packed first so it always claims the outer-
+            # right slot — the same column on every row, preset or custom — with
+            # edit/delete (custom actors only) stacking to its left, since side=
+            # RIGHT packs each new widget to the left of the ones already there.
+            # Every icon is the same fixed-size bitmap (see ICON_SIZE), so unlike
+            # font glyphs, cycling the spinner can't change the button's footprint.
+            ready = os.path.exists(preview_path_for(key))
+            play_button = ttk.Button(
+                row,
+                image=self.icon_play if ready else self.icon_spinner_frames[0],
+                style="Icon.TButton",
+                command=lambda k=key: self.play_preview(k),
+            )
+            play_button.pack(side=tk.RIGHT, padx=(2, 4))
+            if not ready:
+                play_button.config(state=tk.DISABLED)
+                self._preview_spinner_buttons.append(play_button)
+
+            # Presets aren't files on disk — nothing to edit or delete.
+            if kind == "custom":
+                ttk.Button(
+                    row,
+                    image=self.icon_delete,
+                    style="Icon.TButton",
+                    command=lambda k=key: self.delete_voice(k),
+                ).pack(side=tk.RIGHT, padx=2)
+                ttk.Button(
+                    row,
+                    image=self.icon_edit,
+                    style="Icon.TButton",
+                    command=lambda k=key: self.edit_voice(k),
+                ).pack(side=tk.RIGHT, padx=2)
+
+            self.cast_scroll.bind_scroll(row)
+
+    def play_preview(self, key):
+        """Play `key`'s cached preview clip. The button is disabled (showing a
+        spinner instead of ▶) until the preview exists, so this is only ever
+        reachable once it does — bar a rare race with a just-deleted voice."""
+        preview_path = preview_path_for(key)
+        if not os.path.exists(preview_path):
+            return
+        try:
+            data, sr = sf.read(preview_path, dtype="float32")
+            sd.play(data, sr)
+        except Exception as e:
+            messagebox.showerror("Playback Error", f"Couldn't play preview: {e}")
+
+    def edit_voice(self, key):
+        """Open the New Actor dialog in "edit" mode for an existing cloned/designed
+        actor: name pre-filled, retraining overwrites `key` in place. Changing the
+        name before retraining renames it instead — see `train_voice`."""
+        self.open_new_actor_dialog(prefill_name=key)
+
+    def _delete_voice_files(self, key):
+        """Remove a custom voice's saved file, cached preview, and any recordings
+        filed under its name — the on-disk side of both `delete_voice` and a
+        rename in `edit_voice` (train under the new name, then drop the old)."""
+        voice_file = os.path.join(OUTPUT_DIR, f"{key}.pt")
+        if os.path.exists(voice_file):
+            os.remove(voice_file)
+        preview_file = preview_path_for(key)
+        if os.path.exists(preview_file):
+            os.remove(preview_file)
+        recordings_dir = os.path.join(OUTPUT_DIR, key)
+        if os.path.isdir(recordings_dir):
+            shutil.rmtree(recordings_dir)
+
+    def delete_voice(self, key):
+        """Permanently remove a cloned/designed actor: its saved voice file, cached
+        preview, and any recordings filed under its name."""
+        if not messagebox.askyesno(
+            "Delete Actor?",
+            f'Delete "{key}"? This permanently removes its saved voice and '
+            "preview — this can't be undone.",
+        ):
+            return
+        self._delete_voice_files(key)
+        self.refresh_voice_lists()
+
+    # --- Script canvas: the canvas *is* the script — a stack of dialogue blocks
+    # (colored dot + actor name + optional tone + the line itself), built and edited
+    # directly, rather than a text box with bracket-marker syntax. ---
+
+    def build_script_canvas(self, parent):
+        self.script_scroll = ScrollableFrame(parent)
+        self.script_scroll.pack(fill=tk.BOTH, expand=True, padx=20, pady=(15, 10))
+        self.render_script_lines()
+
+    def render_script_lines(self):
+        """(Re)build every dialogue block from `self.script_lines`, plus the
+        trailing "+ Add Line" control. Simplest correct approach given how rarely
+        this needs to run (an edit, an add, a remove, or an import) — no incremental
+        diffing."""
+        for child in self.script_scroll.body.winfo_children():
+            child.destroy()
+
+        for index, line in enumerate(self.script_lines):
+            self._build_script_block(self.script_scroll.body, index, line)
+
+        self.add_line_button = ttk.Button(
+            self.script_scroll.body,
+            text="+ Add Line",
+            command=lambda: self.open_actor_picker(
+                self.add_line_button, self._append_script_line
+            ),
+        )
+        self.add_line_button.pack(fill=tk.X, pady=8)
+        self.script_scroll.bind_scroll(self.add_line_button)
+
+    def _build_script_block(self, parent, index, line):
+        color = color_for_actor(line["key"])
+        block = ttk.Frame(parent, style="Block.TFrame", padding=(12, 10))
+        block.pack(fill=tk.X, pady=(0, 16), anchor=tk.W)
+
+        header = ttk.Frame(block, style="Block.TFrame")
+        header.pack(fill=tk.X, anchor=tk.W)
+
+        ttk.Label(header, text="●", foreground=color, style="Block.TLabel").pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        name_label = ttk.Label(
+            header,
+            text=line["key"].upper(),
+            foreground=color,
+            font=(SCRIPT_FONT_FAMILY, 10, "bold"),
+            cursor="hand2",
+            style="Block.TLabel",
+        )
+        name_label.pack(side=tk.LEFT)
+        name_label.bind(
+            "<ButtonRelease-1>",
+            lambda e, i=index, w=name_label: self.open_actor_picker(
+                w, lambda kind, key, i=i: self._set_line_actor(i, kind, key)
+            ),
+        )
+
+        # Tone has no meaning for a voice-clone line (generate_voice_clone has no
+        # instruct concept) — offered only for preset lines, rather than shown then
+        # silently ignored.
+        if line["kind"] == "preset":
+            tone_entry = ttk.Entry(
+                header,
+                width=22,
+                font=(SCRIPT_FONT_FAMILY, 9, "italic"),
+                style="Block.TEntry",
+            )
+            tone_entry.pack(side=tk.LEFT, padx=(10, 0))
+            if line.get("tone"):
+                tone_entry.insert(0, line["tone"])
+            else:
+                self.add_placeholder_entry(tone_entry, "add a tone…")
+            tone_entry.bind(
+                "<KeyRelease>",
+                lambda e, i=index, w=tone_entry: self._update_line_tone(i, w),
+                add="+",
+            )
+
+        ttk.Button(
+            header,
+            text="✕",
+            width=2,
+            command=lambda i=index: self._remove_script_line(i),
+        ).pack(side=tk.RIGHT)
+
+        text_widget = tk.Text(
+            block,
+            height=1,
+            wrap=tk.WORD,
+            background=SCRIPT_BLOCK_BG,
+            foreground=THEME_FG,
+            insertbackground=THEME_FG,
+            borderwidth=1,
+            relief=tk.SOLID,
+            highlightthickness=1,
+            highlightbackground=SCRIPT_BLOCK_BORDER,
+            highlightcolor=SCRIPT_BLOCK_FOCUS_BORDER,
+            font=(SCRIPT_FONT_FAMILY, 11),
+            padx=6,
+            pady=4,
+        )
+        text_widget.insert("1.0", line["text"])
+        text_widget.pack(fill=tk.X, padx=(15, 0), pady=(6, 0))
+        text_widget.bind(
+            "<KeyRelease>",
+            lambda e, i=index, w=text_widget: self._on_line_text_changed(i, w),
+            add="+",
+        )
+        self._autosize_text(text_widget)
+        self.script_scroll.bind_scroll(block)
+
+    def _autosize_text(self, widget):
+        """Grow/shrink a dialogue Text widget to fit its content — Tkinter Text
+        boxes don't do this on their own."""
+        widget.update_idletasks()
+        try:
+            num_lines = int(widget.count("1.0", "end", "displaylines")[0])
+        except (TypeError, IndexError):
+            num_lines = 1
+        widget.config(height=max(1, num_lines))
+
+    def _on_line_text_changed(self, index, widget):
+        if 0 <= index < len(self.script_lines):
+            self.script_lines[index]["text"] = widget.get("1.0", "end-1c")
+        self._autosize_text(widget)
+
+    def _update_line_tone(self, index, widget):
+        if 0 <= index < len(self.script_lines):
+            self.script_lines[index]["tone"] = self.get_entry_value(widget)
+
+    def _set_line_actor(self, index, kind, key):
+        if 0 <= index < len(self.script_lines):
+            self.script_lines[index]["kind"] = kind
+            self.script_lines[index]["key"] = key
+            if kind == "custom":
+                self.script_lines[index]["tone"] = ""
+            self.render_script_lines()
+
+    def _append_script_line(self, kind, key):
+        self.script_lines.append({"kind": kind, "key": key, "tone": "", "text": ""})
+        self.render_script_lines()
+
+    def _remove_script_line(self, index):
+        if 0 <= index < len(self.script_lines):
+            del self.script_lines[index]
+            self.render_script_lines()
+
+    # --- Script import: paste a plain-text script (screenplay format — an LLM
+    # writes scripts in this shape naturally) and drop it straight into
+    # `self.script_lines`. ---
+
+    def build_import_dialog(self):
+        self.import_window = tk.Toplevel(self.root)
+        self.import_window.title("Import a Script")
+        self.import_window.geometry("640x600")
+        self.import_window.withdraw()
+        self.import_window.transient(self.root)
+        self.import_window.protocol("WM_DELETE_WINDOW", self.close_import_dialog)
+
+        frame = ttk.Frame(self.import_window)
+        frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+
+        ttk.Label(frame, text="Import a Script", font=("Arial", 16, "bold")).pack(
+            anchor=tk.W
+        )
+        ttk.Label(
+            frame,
+            text="Paste plain text — written by hand, or generated by an LLM. "
+            "Format: NAME on its own line, optional (tone) right after it, "
+            "dialogue below, blank line between actors.",
+            foreground="gray",
+            wraplength=580,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(4, 10))
+
+        self.import_text = scrolledtext.ScrolledText(frame, height=16, wrap=tk.WORD)
+        self.import_text.pack(fill=tk.BOTH, expand=True)
+
+        button_row = ttk.Frame(frame)
+        button_row.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(button_row, text="Cancel", command=self.close_import_dialog).pack(
+            side=tk.RIGHT
+        )
+        ttk.Button(
+            button_row,
+            text="Import Script",
+            style="Accent.TButton",
+            command=self._commit_import,
+        ).pack(side=tk.RIGHT, padx=(0, 10))
+
+    def open_import_dialog(self):
+        self.import_text.delete("1.0", tk.END)
+        self.import_window.deiconify()
+        self.import_window.lift()
+        self.import_window.focus_set()
+        self.import_window.grab_set()
+
+    def close_import_dialog(self):
+        self.import_window.grab_release()
+        self.import_window.withdraw()
+
+    def _commit_import(self):
+        text = self.import_text.get("1.0", "end-1c").strip()
+        if not text:
+            messagebox.showerror("Error", "Paste a script first.")
+            return
+
+        lines, errors = parse_screenplay_text(text, build_voice_lookup())
+        if errors:
+            messagebox.showerror(
+                "Unrecognized Actors",
+                "Cast these actors first, or fix the spelling, then import again:\n\n"
+                + "\n".join(errors),
+            )
+            return
+        if not lines:
+            messagebox.showerror("Error", "Couldn't find any dialogue to import.")
+            return
+
+        self.script_lines = lines
+        self.render_script_lines()
+        self.close_import_dialog()
+
+    # --- Proactive voice previews: generated right after a voice is cast, and via a
+    # startup sweep that backfills anything missing (including the 9 presets, on
+    # first-ever run) — so the Cast sidebar's play button is always instant rather
+    # than triggering a model load. Cached as .wav, not .m4a: soundfile/libsndfile
+    # (used for playback) can't decode AAC/M4A, only encode_audio's PyAV path can. ---
+
+    def generate_voice_preview(
+        self, kind, key, model=None, device_type=None, dtype=None
+    ):
+        """Synthesize and cache a short preview clip for one (kind, key) voice.
+
+        Args:
+            kind: "preset" or "custom".
+            key: Voice/speaker name.
+            model, device_type, dtype: Reuse an already-loaded model (e.g. right
+                after casting a voice) instead of loading a fresh one.
+        """
+        device_type = device_type or self.device_type.get()
+        dtype = dtype or DTYPE_MAP[self.generate_dtype.get()]
+        model_size = self.generate_model_size.get()
+
+        if model is None:
+            model_repo = (
+                MODEL_REPOS_CUSTOM_VOICE[model_size]
+                if kind == "preset"
+                else MODEL_REPOS_BASE[model_size]
+            )
+            model, device_type = self._load_model(
+                model_repo, device_type, dtype, show_warning=False
+            )
+
+        if kind == "preset":
+            wavs, sr = model.generate_custom_voice(
+                text=PREVIEW_TEXT, speaker=key, language="Auto"
+            )
+        else:
+            prompt_item = self._load_voice_clone_prompt(key, device_type)
+            wavs, sr = model.generate_voice_clone(
+                text=PREVIEW_TEXT, language="Auto", voice_clone_prompt=[prompt_item]
+            )
+
+        sf.write(preview_path_for(key), wavs[0], sr)
+
+    def sweep_missing_previews(self):
+        """Backfill any voice missing a cached preview — run once, on a background
+        thread, right after the window is constructed. Batches the missing voices by
+        kind so each of Base/CustomVoice loads at most once, same as generation."""
+        try:
+            lookup = build_voice_lookup()
+            actors = {v for v in lookup.values()}
+            existing = {
+                f.removesuffix("_preview.wav")
+                for f in os.listdir(PREVIEW_DIR)
+                if f.endswith("_preview.wav")
+            }
+            missing = [(kind, key) for kind, key in actors if key not in existing]
+            if not missing:
+                return
+
+            device_type = self.device_type.get()
+            dtype = DTYPE_MAP[self.generate_dtype.get()]
+            model_size = self.generate_model_size.get()
+            groups = {}
+            for kind, key in missing:
+                groups.setdefault(kind, []).append(key)
+
+            for kind, keys in groups.items():
+                model_repo = (
+                    MODEL_REPOS_CUSTOM_VOICE[model_size]
+                    if kind == "preset"
+                    else MODEL_REPOS_BASE[model_size]
+                )
+                model, device_type = self._load_model(
+                    model_repo, device_type, dtype, show_warning=False
+                )
+                if kind == "preset":
+                    wavs, sr = model.generate_custom_voice(
+                        text=[PREVIEW_TEXT] * len(keys), speaker=keys, language="Auto"
+                    )
+                else:
+                    prompts = [
+                        self._load_voice_clone_prompt(key, device_type) for key in keys
+                    ]
+                    wavs, sr = model.generate_voice_clone(
+                        text=[PREVIEW_TEXT] * len(keys),
+                        language="Auto",
+                        voice_clone_prompt=prompts,
+                    )
+                for key, wav in zip(keys, wavs):
+                    sf.write(preview_path_for(key), wav, sr)
+                # Refresh after each kind group completes (rather than only once at
+                # the very end) so preset and cloned buttons flip from spinner to ▶
+                # as soon as their own group is actually done, not the slower of
+                # the two.
+                self.root.after(0, self.refresh_cast_sidebar)
+        except Exception:
+            # Best-effort backfill — a failure here just means some preview buttons
+            # stay in the "not ready yet" state until the next launch retries.
+            pass
 
     def browse_audio_file(self):
         filename = filedialog.askopenfilename(
@@ -1449,21 +2092,36 @@ class QwenTTSGUI:
             return Qwen3TTSModel.from_pretrained(model_repo, **config), "cpu"
 
     def train_voice(self):
-        """Validate the Train Voice form and kick off `_train_voice_thread`."""
+        """Validate the Train Voice form and kick off `_train_voice_thread`.
+
+        In "new actor" mode (`self._editing_voice_key` is None), any name already
+        in use — preset or custom — is rejected outright; there's no "New Actor"
+        reason to collide with one. In "edit" mode, retraining under the actor's
+        own name needs no extra check (that's the point of Edit); typing a
+        *different*, free name renames it (passed through as `renaming_from` for
+        `_train_voice_thread` to drop the old files under once the new ones save).
+        """
         voice_name = self.voice_name_entry.get().strip()
         if not voice_name:
             messagebox.showerror("Error", "Please enter a voice name")
             return
 
-        if (
-            self.train_voice_combo.get() == NEW_VOICE_LABEL
-            and voice_name in list_custom_voices()
-        ):
-            if not messagebox.askyesno(
-                "Overwrite Voice?",
-                f"A voice named '{voice_name}' already exists. Overwrite it?",
-            ):
+        editing_key = self._editing_voice_key
+        renaming_from = None
+        is_same_voice = (
+            editing_key is not None and voice_name.lower() == editing_key.lower()
+        )
+        if not is_same_voice:
+            existing = build_voice_lookup().get(voice_name.lower())
+            if existing is not None:
+                _, existing_key = existing
+                messagebox.showerror(
+                    "Name Already Used",
+                    f"A voice named '{existing_key}' already exists — pick a "
+                    "different name, or use that actor's Edit button instead.",
+                )
                 return
+            renaming_from = editing_key
 
         method = self.train_method.get()
         device_type = self.device_type.get()
@@ -1494,6 +2152,7 @@ class QwenTTSGUI:
                 script_text,
                 x_vector_only,
                 design_instruct,
+                renaming_from,
             ),
         )
         thread.daemon = True
@@ -1508,6 +2167,7 @@ class QwenTTSGUI:
         script_text=None,
         x_vector_only=False,
         design_instruct=None,
+        renaming_from=None,
     ):
         """Build and save a VoiceClonePromptItem for `voice_name` (background thread).
 
@@ -1527,6 +2187,9 @@ class QwenTTSGUI:
                 Faster and needs no matching transcript, but lower fidelity.
             design_instruct: Natural-language voice description, when
                 method == "design" (e.g. "warm elderly British female voice").
+            renaming_from: Set when editing an actor under a new name — once
+                `voice_name` saves successfully, this old voice's files are
+                removed so the rename doesn't leave a duplicate behind.
         """
         panel = self.train_progress_panel
         # "design" has an extra leading step (see set_train_busy) — everything below
@@ -1687,6 +2350,8 @@ class QwenTTSGUI:
             # the voice picker's cache scan work.
             output_file = os.path.join(OUTPUT_DIR, f"{voice_name}.pt")
             torch.save(prompt_items, output_file)
+            if renaming_from is not None:
+                self._delete_voice_files(renaming_from)
             self.root.after(0, lambda i=step: panel.complete_step(i))
 
             self.root.after(
@@ -1706,6 +2371,28 @@ class QwenTTSGUI:
             )
             self.root.after(0, self.refresh_voice_lists)
 
+            try:
+                # Reuse the model already loaded above — cheap, and means the Cast
+                # sidebar's preview is ready without waiting for the next sweep.
+                self.generate_voice_preview(
+                    "custom",
+                    voice_name,
+                    model=model,
+                    device_type=device_type,
+                    dtype=dtype,
+                )
+            except Exception:
+                pass  # best-effort — the next startup sweep will retry
+            # Flips the new actor's Cast sidebar button from spinner to ▶ (the
+            # refresh above ran too early to catch this — it's scheduled before
+            # this preview even starts generating).
+            self.root.after(0, self.refresh_cast_sidebar)
+
+            on_created = self._new_actor_on_created
+            self.root.after(
+                0, lambda: self._finish_new_actor_dialog(voice_name, on_created)
+            )
+
         except Exception as e:
             error_msg = f"Error during training: {e}"
             self.root.after(0, lambda i=step: panel.fail_step(i))
@@ -1720,25 +2407,25 @@ class QwenTTSGUI:
             self.root.after(0, lambda: self.set_train_busy(False))
 
     def generate_speech(self):
-        """Parse [VoiceName] markers, resolve a save path, and kick off
-        `_generate_speech_thread`."""
-        text = self.get_text_value(self.text_entry)
+        """Build segments from `self.script_lines`, resolve a save path, and kick
+        off `_generate_speech_thread`. No parsing needed — every line already has a
+        real actor, since it only ever came from the actor picker or a validated
+        import."""
         output_format = self.output_format.get()
         language = self.use_language_combo.get()
 
-        if not text:
-            messagebox.showerror("Error", "Please enter text to generate")
+        if not self.script_lines:
+            messagebox.showerror("Error", "Add at least one line to the script first")
             return
 
-        segments, errors, warnings = parse_voice_segments(text, build_voice_lookup())
-        if errors:
-            messagebox.showerror("Error", "\n\n".join(errors))
-            return
+        segments = [
+            (line["kind"], line["key"], line["text"], line["tone"])
+            for line in self.script_lines
+            if line["text"].strip()
+        ]
         if not segments:
-            messagebox.showerror("Error", "Please enter text to generate")
+            messagebox.showerror("Error", "Every line in the script is empty")
             return
-        if warnings:
-            messagebox.showwarning("Note", "\n\n".join(warnings))
 
         output_file = self._ask_save_path(segments, output_format)
         if not output_file:
@@ -1877,8 +2564,8 @@ class QwenTTSGUI:
         single batched call, then reassembles the results in original text order.
 
         Args:
-            segments: Ordered (kind, key, text, instruct) tuples from
-                `parse_voice_segments`. `instruct` is only meaningful for "preset"
+            segments: Ordered (kind, key, text, instruct) tuples built from
+                `self.script_lines`. `instruct` is only meaningful for "preset"
                 segments — generate_voice_clone has no instruct concept.
             output_format: "wav", "mp3", or "m4a".
             language: One of SUPPORTED_LANGUAGES, applied to every segment.
@@ -2103,6 +2790,7 @@ class QwenTTSGUI:
 
 def main():
     root = tk.Tk()
+    sv_ttk.set_theme("light")
     QwenTTSGUI(root)
     root.mainloop()
 
