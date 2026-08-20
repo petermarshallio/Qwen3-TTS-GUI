@@ -7,7 +7,6 @@
 /.venv
 /WAVs
 /local
-/TODO.md
 
 # macOS
 .DS_Store
