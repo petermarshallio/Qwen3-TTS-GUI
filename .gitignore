@@ -2,10 +2,21 @@
 *.wav
 /build
 /dist
-/src/__pycache__
 *.mp3
 /mp3s
 /.venv
 /WAVs
 /local
 /TODO.md
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
