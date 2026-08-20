@@ -120,11 +120,6 @@ reusable via `[VoiceName]` markers just like a recorded one, with no separate
       CUDA — CPU always forces `float32` regardless of the setting, since
       float16/bfloat16 support on CPU-only torch builds is inconsistent
 
-## Reference audio input flexibility (low priority)
-
-- [ ] `ref_audio` also accepts a URL or base64 string, not just a local file path —
-      probably not worth UI space, but note in case a use case comes up
-
 ## Not a gap — don't implement
 
 - `non_streaming_mode`: despite the name, the library's own docstring says this only
@@ -134,3 +129,5 @@ reusable via `[VoiceName]` markers just like a recorded one, with no separate
   `text`/`ref_audio`/`language`): dropped. Multi-voice `[VoiceName]` generation
   already batches same-kind segments into a single call under the hood — a separate
   user-facing "batch mode" wasn't asked for beyond that.
+- `ref_audio` accepting a URL or base64 string, not just a local file path: dropped —
+  not worth UI space, no use case has come up.
