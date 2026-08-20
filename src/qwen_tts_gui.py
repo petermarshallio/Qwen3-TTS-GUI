@@ -10,6 +10,7 @@ from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
 import threading
 import os
 import sys
+import subprocess
 from datetime import datetime
 
 # Fix CUDA detection in PyInstaller bundles
@@ -105,6 +106,19 @@ def encode_audio(samples, sr, output_file, output_format):
     container.close()
 
 
+def reveal_in_file_manager(path):
+    """Open the OS file manager with `path` selected (best-effort, ignores failures)."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", "-R", path], check=False)
+        elif sys.platform.startswith("win"):
+            subprocess.run(["explorer", "/select,", path], check=False)
+        else:
+            subprocess.run(["xdg-open", os.path.dirname(path)], check=False)
+    except Exception:
+        pass
+
+
 class QwenTTSGUI:
     def __init__(self, root):
         self.root = root
@@ -183,8 +197,9 @@ class QwenTTSGUI:
         return widget.get("1.0", tk.END).strip()
 
     def get_entry_value(self, widget):
-        """Content of a placeholder-aware Entry widget, empty while the placeholder shows."""
-        if getattr(widget, "showing_placeholder", False):
+        """Content of a placeholder-aware Entry widget, empty while the placeholder
+        (or a disabled-state explanatory note, e.g. Instruction for custom voices) shows."""
+        if getattr(widget, "showing_placeholder", False) or getattr(widget, "disabled_note_showing", False):
             return ""
         return widget.get().strip()
 
@@ -200,6 +215,67 @@ class QwenTTSGUI:
         widget.bind("<FocusIn>", lambda e: widget.after(1, update), add="+")
         widget.bind("<FocusOut>", lambda e: widget.after(1, update), add="+")
         update()
+
+    # --- Busy state: disable every control on the tab + show a spinner while a
+    # background thread is running. The library gives no generation-progress hook
+    # (see modeling_qwen3_tts.py — kwargs never reach the inner streamer-capable
+    # call), so this is deliberately indeterminate rather than a fake percentage. ---
+
+    def _set_frame_enabled(self, widget, enabled):
+        """Recursively enable/disable every interactive control under `widget`."""
+        for child in widget.winfo_children():
+            cls = child.winfo_class()
+            if cls == "TCombobox":
+                child.config(state="readonly" if enabled else "disabled")
+            elif cls in ("TButton", "TRadiobutton", "TEntry", "Text"):
+                child.config(state=tk.NORMAL if enabled else tk.DISABLED)
+            self._set_frame_enabled(child, enabled)
+
+    def set_train_busy(self, busy):
+        if busy:
+            self.train_progress.pack(fill=tk.X, padx=20, pady=(0, 10), before=self.train_status_label)
+            self.train_progress.start(10)
+        else:
+            self.train_progress.stop()
+            self.train_progress.pack_forget()
+
+        self._set_frame_enabled(self.train_frame, not busy)
+        self.train_button.config(text="Training..." if busy else "Train Voice")
+        if not busy and self.train_voice_combo.get() != NEW_VOICE_LABEL:
+            # Voice Name must stay disabled (auto-filled) when updating an existing
+            # voice — re-set just the state, without touching its content.
+            self.voice_name_entry.config(state=tk.DISABLED)
+
+    def set_use_busy(self, busy):
+        if busy:
+            self.use_progress.pack(fill=tk.X, padx=20, pady=(0, 10), before=self.use_status_label)
+            self.use_progress.start(10)
+        else:
+            self.use_progress.stop()
+            self.use_progress.pack_forget()
+
+        self._set_frame_enabled(self.use_frame, not busy)
+        self.generate_button.config(text="Generating..." if busy else "Generate Speech")
+        if not busy:
+            # Instruction box's visibility depends on whether a preset is selected.
+            self.on_use_voice_selected()
+
+    def show_success_with_link(self, title, message, file_path):
+        """Success dialog with a clickable link that reveals the generated file."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+
+        ttk.Label(dialog, text=message, wraplength=400, justify=tk.LEFT).pack(padx=20, pady=(20, 10))
+
+        link = ttk.Label(dialog, text=file_path, foreground="blue", cursor="hand2",
+                          font=("TkDefaultFont", 10, "underline"), wraplength=400, justify=tk.LEFT)
+        link.pack(padx=20, pady=(0, 10))
+        link.bind("<Button-1>", lambda e: reveal_in_file_manager(file_path))
+
+        ttk.Button(dialog, text="OK", command=dialog.destroy).pack(pady=(0, 20))
+        dialog.grab_set()
 
     def setup_train_tab(self):
         # Title
@@ -281,11 +357,14 @@ class QwenTTSGUI:
         # Status and progress
         self.train_status_label = ttk.Label(self.train_frame, text="", foreground="blue")
         self.train_status_label.pack(pady=10)
-        
+
+        self.train_progress = ttk.Progressbar(self.train_frame, mode="indeterminate")
+        # Not packed here — shown only while training is in progress (set_train_busy).
+
         # Train button
-        train_button = ttk.Button(self.train_frame, text="Train Voice", command=self.train_voice,
+        self.train_button = ttk.Button(self.train_frame, text="Train Voice", command=self.train_voice,
                                  style="Accent.TButton")
-        train_button.pack(pady=20)
+        self.train_button.pack(pady=20)
 
         self.update_train_method_visibility()
         self.refresh_train_voice_list()
@@ -349,8 +428,11 @@ class QwenTTSGUI:
         self.use_language_combo.set("Auto")
         self.use_language_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
 
-        # Instruction (shown only for preset voices, e.g. "say it in an angry tone")
+        # Instruction — only meaningful for preset voices (generate_voice_clone has no
+        # instruct parameter at all). Stays visible for both, greyed out and explained
+        # rather than hidden for custom voices — see on_use_voice_selected.
         self.instruct_frame = ttk.Frame(voice_frame)
+        self.instruct_frame.pack(fill=tk.X, pady=5)
         ttk.Label(self.instruct_frame, text="Instruction:").pack(side=tk.LEFT, padx=5)
         self.instruct_entry = ttk.Entry(self.instruct_frame, width=37)
         self.instruct_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
@@ -401,11 +483,14 @@ class QwenTTSGUI:
         # Status
         self.use_status_label = ttk.Label(self.use_frame, text="", foreground="blue")
         self.use_status_label.pack(pady=10)
-        
+
+        self.use_progress = ttk.Progressbar(self.use_frame, mode="indeterminate")
+        # Not packed here — shown only while generation is in progress (set_use_busy).
+
         # Generate button
-        generate_button = ttk.Button(self.use_frame, text="Generate Speech", command=self.generate_speech,
+        self.generate_button = ttk.Button(self.use_frame, text="Generate Speech", command=self.generate_speech,
                                     style="Accent.TButton")
-        generate_button.pack(pady=20)
+        self.generate_button.pack(pady=20)
 
         self.use_voice_map = {}
         self.refresh_use_voice_list()
@@ -433,12 +518,34 @@ class QwenTTSGUI:
         self.on_use_voice_selected()
 
     def on_use_voice_selected(self):
-        """Show the Instruction box only for preset voices (generate_custom_voice's instruct)."""
+        """Instruction only does anything for preset voices (generate_voice_clone has no
+        instruct parameter at all) — grey it out with an explanation for custom voices
+        rather than hiding it, preserving whatever the user typed for when they switch back."""
         kind, _ = self.use_voice_map.get(self.use_voice_combo.get(), (None, None))
+        entry = self.instruct_entry
         if kind == "preset":
-            self.instruct_frame.pack(fill=tk.X, pady=5)
+            if getattr(entry, "disabled_note_showing", False):
+                entry.config(state=tk.NORMAL)
+                entry.delete(0, tk.END)
+                saved = getattr(entry, "saved_real_value", "")
+                if saved:
+                    entry.insert(0, saved)
+                    entry.config(foreground="black")
+                    entry.showing_placeholder = False
+                else:
+                    entry.insert(0, "e.g. say it in an angry tone")
+                    entry.config(foreground="grey")
+                    entry.showing_placeholder = True
+                entry.disabled_note_showing = False
+            else:
+                entry.config(state=tk.NORMAL)
         else:
-            self.instruct_frame.pack_forget()
+            if not getattr(entry, "disabled_note_showing", False):
+                entry.saved_real_value = self.get_entry_value(entry)
+                entry.delete(0, tk.END)
+                entry.insert(0, "Instructions not supported for custom models.")
+                entry.disabled_note_showing = True
+            entry.config(foreground="grey", state=tk.DISABLED)
 
     def browse_audio_file(self):
         filename = filedialog.askopenfilename(
@@ -553,17 +660,19 @@ class QwenTTSGUI:
 
         method = self.train_method.get()
         device_type = self.device_type.get()
-        
+
+        self.set_train_busy(True)
+
         # Run training in a separate thread to avoid blocking UI
         thread = threading.Thread(target=self._train_voice_thread, args=(voice_name, method, device_type))
         thread.daemon = True
         thread.start()
-    
+
     def _train_voice_thread(self, voice_name, method, device_type):
         try:
             self.root.after(0, lambda: self.train_status_label.config(
                 text="Loading model...", foreground="blue"))
-            
+
             # Load model
             config = self.get_model_config(device_type, show_warning=True)
             try:
@@ -669,16 +778,18 @@ class QwenTTSGUI:
             self.root.after(0, lambda: self.train_status_label.config(
                 text=f"Voice '{voice_name}' trained successfully! Saved to {output_file}",
                 foreground="green"))
-            self.root.after(0, lambda: messagebox.showinfo("Success",
-                f"Voice '{voice_name}' has been trained and saved to {output_file}"))
+            self.root.after(0, lambda: self.show_success_with_link(
+                "Success", f"Voice '{voice_name}' has been trained and saved to:", output_file))
             self.root.after(0, self.refresh_voice_lists)
-            
+
         except Exception as e:
             error_msg = f"Error during training: {str(e)}"
             self.root.after(0, lambda: self.train_status_label.config(
                 text=error_msg, foreground="red"))
             self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
-    
+        finally:
+            self.root.after(0, lambda: self.set_train_busy(False))
+
     def generate_speech(self):
         text = self.get_text_value(self.text_entry)
         output_format = self.output_format.get()
@@ -695,6 +806,8 @@ class QwenTTSGUI:
         if not text:
             messagebox.showerror("Error", "Please enter text to generate")
             return
+
+        self.set_use_busy(True)
 
         # Run generation in a separate thread
         thread = threading.Thread(
@@ -841,14 +954,16 @@ class QwenTTSGUI:
             self.root.after(0, lambda: self.use_status_label.config(
                 text=f"Speech generated successfully! Saved to {output_file}",
                 foreground="green"))
-            self.root.after(0, lambda: messagebox.showinfo("Success",
-                f"Speech has been generated and saved to {output_file}"))
+            self.root.after(0, lambda: self.show_success_with_link(
+                "Success", "Speech has been generated and saved to:", output_file))
 
         except Exception as e:
             error_msg = f"Error during generation: {str(e)}"
             self.root.after(0, lambda: self.use_status_label.config(
                 text=error_msg, foreground="red"))
             self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+        finally:
+            self.root.after(0, lambda: self.set_use_busy(False))
 
 def main():
     root = tk.Tk()
