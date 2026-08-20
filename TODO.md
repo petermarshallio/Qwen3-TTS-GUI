@@ -1,9 +1,13 @@
 # TODO: qwen-tts feature gaps
 
-A "Configure" tab now exists for settings you'd set once rather than per run (currently
-just device/CUDA selection — disabled when CUDA isn't available, so you can't pick it
-and get repeated "falling back to CPU" warnings). Model size and dtype below belong
-there when implemented.
+A "Configure" tab exists for settings you'd set once rather than per run, in three
+sections: Global (just Device — disabled when CUDA isn't available, so you can't pick
+it and get repeated "falling back to CPU" warnings), Train, and Generate (each with
+their own Model size + dtype, since the two flows might reasonably want different
+tradeoffs — e.g. the full model for training a voice you're keeping, a lighter one for
+quick generation previews). `x_vector_only_mode` ended up as a plain checkbox on the
+Train Voice tab instead (see below) — it's a per-training-run choice (do I have a good
+transcript for this recording or not), not a once-per-install setting.
 
 ## Multi-voice generation (`[VoiceName]` markers)
 
@@ -36,7 +40,8 @@ resolved against the local custom-voice cache plus the 9 presets. A `[PresetName
 marker generates via the CustomVoice checkpoint instead of Base.
 
 - [x] Add a way to select the `CustomVoice` checkpoint (via a `[PresetName]` marker,
-      resolved to `MODEL_REPO_CUSTOM_VOICE`)
+      resolved to `MODEL_REPOS_CUSTOM_VOICE[size]` — size from Configure's Generate
+      section)
 - [x] Add a "Speaker" dropdown populated from `model.get_supported_speakers()` — actually
       hardcoded (`PRESET_VOICES`) rather than fetched at runtime, see decision below
       (9 presets: Vivian, Serena, Uncle_Fu, Dylan, Eric, Ryan, Aiden, Ono_Anna, Sohee)
@@ -67,10 +72,13 @@ before the user has done anything. The 9 names are fixed for this released check
 
 ## Voice-clone mode (x_vector_only_mode)
 
-- [ ] Expose a checkbox for `x_vector_only_mode` in the Train Voice tab (currently
-      hardcoded to `False` at [qwen_tts_gui.py:971](src/qwen_tts_gui.py#L971))
-- [ ] When checked: skip requiring a reference transcript, using speaker-embedding-only
-      cloning (faster, lower fidelity)
+- [x] Expose a checkbox for `x_vector_only_mode` in the Train Voice tab — labeled
+      "Quick clone (skip transcript matching — faster, lower fidelity)", next to the
+      Train Voice button
+- [x] When checked: skip requiring a reference transcript for the "file" method
+      (the "record" method always has one already, via the script picker above) —
+      `create_voice_clone_prompt` gets `x_vector_only_mode=True`, using
+      speaker-embedding-only cloning
 
 ## Generation / sampling controls
 
@@ -84,13 +92,18 @@ before the user has done anything. The 9 names are fixed for this released check
 
 ## Model size (Configure tab)
 
-- [ ] Offer `0.6B` variants alongside `1.7B` for each model type (faster/lighter,
-      same three model types: Base / CustomVoice / VoiceDesign)
+- [x] Offer `0.6B` variants alongside `1.7B` for Base and CustomVoice (`MODEL_SIZES`,
+      `MODEL_REPOS_BASE`/`MODEL_REPOS_CUSTOM_VOICE`), independently for Train and
+      Generate. VoiceDesign isn't offered a size choice — the model card lists no
+      0.6B-VoiceDesign release, and the model itself isn't implemented in this app yet
+      (see below)
 
 ## dtype (Configure tab)
 
-- [ ] Add `float16` as a third option alongside the current `bfloat16` (CUDA) /
-      `float32` (CPU)
+- [x] Add `float16` as a third option alongside `bfloat16`/`float32`, independently
+      for Train and Generate (`DTYPE_OPTIONS`/`DTYPE_MAP`). Only takes effect on
+      CUDA — CPU always forces `float32` regardless of the setting, since
+      float16/bfloat16 support on CPU-only torch builds is inconsistent
 
 ## Batch generation
 

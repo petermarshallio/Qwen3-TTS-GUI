@@ -48,10 +48,28 @@ else:
 OUTPUT_DIR = os.path.join(_base_dir, "local")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-MODEL_REPO_BASE = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-MODEL_REPO_CUSTOM_VOICE = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+MODEL_SIZES = ("1.7B", "0.6B")
+MODEL_REPOS_BASE = {
+    "1.7B": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    "0.6B": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+}
+MODEL_REPOS_CUSTOM_VOICE = {
+    "1.7B": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "0.6B": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+}
+# VoiceDesign has no 0.6B release yet per the model card's own table, and isn't wired
+# up in this app at all yet (see TODO.md) — not offered as a size choice.
 
-# Fixed speaker list for MODEL_REPO_CUSTOM_VOICE (from the model card). Not fetched
+# Explicit dtype choices for Configure — CPU always forces float32 regardless (see
+# get_model_config), so these only take effect when actually running on CUDA.
+DTYPE_OPTIONS = ("bfloat16", "float32", "float16")
+DTYPE_MAP = {
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+    "float16": torch.float16,
+}
+
+# Fixed speaker list for MODEL_REPOS_CUSTOM_VOICE (from the model card). Not fetched
 # dynamically via AutoConfig, which would need network/HF-cache access just to
 # populate a dropdown before the user has done anything.
 PRESET_VOICES = [
@@ -398,6 +416,11 @@ class QwenTTSGUI:
         self.root.geometry("800x1000")
 
         self.device_type = tk.StringVar(value="cuda")
+        default_dtype = "bfloat16" if torch.cuda.is_available() else "float32"
+        self.train_model_size = tk.StringVar(value="1.7B")
+        self.train_dtype = tk.StringVar(value=default_dtype)
+        self.generate_model_size = tk.StringVar(value="1.7B")
+        self.generate_dtype = tk.StringVar(value=default_dtype)
         self.recording = False
         self.audio_chunks = []
         self.recording_map = {}  # filename -> full path, for the current voice's takes
@@ -857,6 +880,13 @@ class QwenTTSGUI:
         self.train_progress_panel = ProgressPanel(self.train_frame)
         # Not shown here — shown only while training is in progress (set_train_busy).
 
+        self.x_vector_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            self.train_frame,
+            text="Quick clone (skip transcript matching — faster, lower fidelity)",
+            variable=self.x_vector_only_var,
+        ).pack(pady=(0, 5))
+
         self.train_button = ttk.Button(
             self.train_frame,
             text="Train Voice",
@@ -1011,16 +1041,23 @@ class QwenTTSGUI:
         self.cancel_button.pack(side=tk.LEFT)
 
     def setup_configure_tab(self):
-        """Settings shared across tabs — currently just the device — rather than
-        per-run choices repeated on every tab."""
+        """Settings you'd set once for this machine, rather than per-run choices
+        repeated on every tab: a Global section (just Device — a fact about the
+        hardware, not a per-flow tradeoff), then Train and Generate sections for
+        settings where the two flows might reasonably want different tradeoffs
+        (a bigger/slower model for a voice you're keeping forever, a smaller/faster
+        one for quick generation previews)."""
         title_label = ttk.Label(
             self.configure_frame, text="Configuration", font=("Arial", 16, "bold")
         )
         title_label.pack(pady=10)
 
-        device_frame = ttk.LabelFrame(self.configure_frame, text="Device", padding=10)
-        device_frame.pack(fill=tk.X, padx=20, pady=10)
+        global_frame = ttk.LabelFrame(self.configure_frame, text="Global", padding=10)
+        global_frame.pack(fill=tk.X, padx=20, pady=10)
 
+        device_frame = ttk.Frame(global_frame)
+        device_frame.pack(fill=tk.X)
+        ttk.Label(device_frame, text="Device:").pack(side=tk.LEFT, padx=(0, 10))
         cuda_radio = ttk.Radiobutton(
             device_frame, text="CUDA (GPU)", variable=self.device_type, value="cuda"
         )
@@ -1040,6 +1077,42 @@ class QwenTTSGUI:
                 text="(CUDA not available on this machine)",
                 foreground="gray",
             ).pack(side=tk.LEFT, padx=10)
+
+        self._setup_model_settings_section(
+            self.configure_frame, "Train", self.train_model_size, self.train_dtype
+        )
+        self._setup_model_settings_section(
+            self.configure_frame,
+            "Generate",
+            self.generate_model_size,
+            self.generate_dtype,
+        )
+
+    def _setup_model_settings_section(self, parent, title, model_size_var, dtype_var):
+        """Model size + dtype radios, shared layout for the Train/Generate sections."""
+        frame = ttk.LabelFrame(parent, text=title, padding=10)
+        frame.pack(fill=tk.X, padx=20, pady=10)
+
+        size_frame = ttk.Frame(frame)
+        size_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(size_frame, text="Model size:").pack(side=tk.LEFT, padx=(0, 10))
+        for size in MODEL_SIZES:
+            ttk.Radiobutton(
+                size_frame, text=size, variable=model_size_var, value=size
+            ).pack(side=tk.LEFT, padx=10)
+
+        dtype_frame = ttk.Frame(frame)
+        dtype_frame.pack(fill=tk.X)
+        ttk.Label(dtype_frame, text="dtype:").pack(side=tk.LEFT, padx=(0, 10))
+        for dtype_name in DTYPE_OPTIONS:
+            ttk.Radiobutton(
+                dtype_frame, text=dtype_name, variable=dtype_var, value=dtype_name
+            ).pack(side=tk.LEFT, padx=10)
+        ttk.Label(
+            frame,
+            text="dtype only applies when running on CUDA — CPU always uses float32.",
+            foreground="gray",
+        ).pack(anchor=tk.W, pady=(5, 0))
 
     def browse_audio_file(self):
         filename = filedialog.askopenfilename(
@@ -1103,14 +1176,17 @@ class QwenTTSGUI:
 
         self.record_button.config(text="Start Recording")
 
-    def get_model_config(self, device_type, show_warning=True):
+    def get_model_config(self, device_type, dtype, show_warning=True):
         """Build `Qwen3TTSModel.from_pretrained` kwargs for the given device.
 
         Falls back to CPU if `device_type` is "cuda" but CUDA isn't actually
-        available.
+        available. `dtype` is only honored on CUDA — CPU always forces float32,
+        since float16/bfloat16 support on CPU-only torch builds is inconsistent.
 
         Args:
             device_type: "cuda" or "cpu".
+            dtype: A torch dtype (from Configure's dtype setting), used when
+                `device_type` resolves to "cuda".
             show_warning: Whether to show a dialog when falling back from cuda to cpu.
 
         Returns:
@@ -1152,7 +1228,7 @@ class QwenTTSGUI:
 
             return {
                 "device_map": "auto",
-                "dtype": torch.bfloat16,
+                "dtype": dtype,
                 "attn_implementation": attn_impl,
             }
         return {
@@ -1162,13 +1238,14 @@ class QwenTTSGUI:
         }
 
     def _load_model(
-        self, model_repo, device_type, show_warning=True, status_label=None
+        self, model_repo, device_type, dtype, show_warning=True, status_label=None
     ):
         """Load `model_repo`, falling back to CPU once on a CUDA compat error.
 
         Args:
             model_repo: HuggingFace repo id to load.
             device_type: "cuda" or "cpu".
+            dtype: A torch dtype, passed through to `get_model_config`.
             show_warning: Passed through to `get_model_config`.
             status_label: If given, updated with a fallback message on retry.
 
@@ -1176,7 +1253,7 @@ class QwenTTSGUI:
             A (model, effective_device_type) tuple — `effective_device_type` is
             "cpu" if a CUDA compatibility error forced a fallback.
         """
-        config = self.get_model_config(device_type, show_warning=show_warning)
+        config = self.get_model_config(device_type, dtype, show_warning=show_warning)
         try:
             return Qwen3TTSModel.from_pretrained(model_repo, **config), device_type
         except (RuntimeError, torch.cuda.CudaError) as cuda_error:
@@ -1200,7 +1277,7 @@ class QwenTTSGUI:
                     f"CUDA error detected: {error_text}\n\nFalling back to CPU mode. This may be slower.",
                 ),
             )
-            config = self.get_model_config("cpu", show_warning=False)
+            config = self.get_model_config("cpu", dtype, show_warning=False)
             return Qwen3TTSModel.from_pretrained(model_repo, **config), "cpu"
 
     def train_voice(self):
@@ -1222,6 +1299,7 @@ class QwenTTSGUI:
 
         method = self.train_method.get()
         device_type = self.device_type.get()
+        x_vector_only = self.x_vector_only_var.get()
 
         recording_path = None
         script_text = None
@@ -1233,13 +1311,26 @@ class QwenTTSGUI:
 
         thread = threading.Thread(
             target=self._train_voice_thread,
-            args=(voice_name, method, device_type, recording_path, script_text),
+            args=(
+                voice_name,
+                method,
+                device_type,
+                recording_path,
+                script_text,
+                x_vector_only,
+            ),
         )
         thread.daemon = True
         thread.start()
 
     def _train_voice_thread(
-        self, voice_name, method, device_type, recording_path=None, script_text=None
+        self,
+        voice_name,
+        method,
+        device_type,
+        recording_path=None,
+        script_text=None,
+        x_vector_only=False,
     ):
         """Build and save a VoiceClonePromptItem for `voice_name` (background thread).
 
@@ -1251,6 +1342,9 @@ class QwenTTSGUI:
             recording_path: Recorded take to use, when method == "record".
             script_text: The training script the recording actually read aloud
                 (picked from TRAINING_SCRIPTS), when method == "record".
+            x_vector_only: "Quick clone" — use only the reference audio's speaker
+                embedding, skipping in-context conditioning on its transcript.
+                Faster and needs no matching transcript, but lower fidelity.
         """
         panel = self.train_progress_panel
         step = 0
@@ -1262,8 +1356,10 @@ class QwenTTSGUI:
                     text="Loading model...", foreground="blue"
                 ),
             )
+            model_repo = MODEL_REPOS_BASE[self.train_model_size.get()]
+            dtype = DTYPE_MAP[self.train_dtype.get()]
             model, device_type = self._load_model(
-                MODEL_REPO_BASE, device_type, status_label=self.train_status_label
+                model_repo, device_type, dtype, status_label=self.train_status_label
             )
             self.root.after(0, lambda: panel.complete_step(0))
 
@@ -1280,11 +1376,13 @@ class QwenTTSGUI:
                     )
                     return
 
-                if not ref_text:
+                if not x_vector_only and not ref_text:
                     self.root.after(
                         0,
                         lambda: messagebox.showerror(
-                            "Error", "Please enter a transcript"
+                            "Error",
+                            'Please enter a transcript (or check "Quick clone" '
+                            "to skip it)",
                         ),
                     )
                     return
@@ -1327,7 +1425,7 @@ class QwenTTSGUI:
                 return m.create_voice_clone_prompt(
                     ref_audio=ref_audio,
                     ref_text=ref_text,
-                    x_vector_only_mode=False,
+                    x_vector_only_mode=x_vector_only,
                 )
 
             try:
@@ -1352,7 +1450,7 @@ class QwenTTSGUI:
                     ),
                 )
                 model, device_type = self._load_model(
-                    MODEL_REPO_BASE, "cpu", show_warning=False
+                    model_repo, "cpu", dtype, show_warning=False
                 )
                 prompt_items = do_create_prompt(model)
             self.root.after(0, lambda: panel.complete_step(1))
@@ -1572,6 +1670,8 @@ class QwenTTSGUI:
             loaded_prompts = {}  # custom voice key -> VoiceClonePromptItem
 
             total_groups = len(kinds_needed)
+            model_size = self.generate_model_size.get()
+            dtype = DTYPE_MAP[self.generate_dtype.get()]
 
             for group_index, kind in enumerate(kinds_needed):
                 if self._cancelled():
@@ -1580,7 +1680,9 @@ class QwenTTSGUI:
                 self.root.after(0, lambda i=step: panel.start_step(i))
                 group = groups[kind]
                 model_repo = (
-                    MODEL_REPO_CUSTOM_VOICE if kind == "preset" else MODEL_REPO_BASE
+                    MODEL_REPOS_CUSTOM_VOICE[model_size]
+                    if kind == "preset"
+                    else MODEL_REPOS_BASE[model_size]
                 )
 
                 # Only worth naming the group/voices once there's more than one group —
@@ -1601,6 +1703,7 @@ class QwenTTSGUI:
                 model, device_type = self._load_model(
                     model_repo,
                     device_type,
+                    dtype,
                     show_warning=(group_index == 0),
                     status_label=self.use_status_label,
                 )
@@ -1670,7 +1773,7 @@ class QwenTTSGUI:
                         ),
                     )
                     model, device_type = self._load_model(
-                        model_repo, "cpu", show_warning=False
+                        model_repo, "cpu", dtype, show_warning=False
                     )
                     if kind == "custom":
                         # Prompts loaded above may be pinned to the failed device — reload on
