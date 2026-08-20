@@ -1,7 +1,6 @@
 # TODO: qwen-tts feature gaps
 
-Gap analysis between what `qwen_tts` (0.1.1) exposes and what `src/qwen_tts_gui.py`
-currently uses. Local tracking only, not committed. Ordered roughly by bang-for-buck.
+- [ ] Allow some kind of placeholder like `[` and `]` to set what voice should be used from a particular point forwards. Then split up generation into tasks, per [VOICE], and compile into a single audio file at the end. The input text box should use the list of available voices to validate before generate happens - with the text box itself (preferably) interactively allowing voice selection when `[` is entered (like an auto-complete).
 
 ## CustomVoice model (preset voices)
 
