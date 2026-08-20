@@ -9,6 +9,8 @@ from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
 import threading
 import os
 import sys
+import shutil
+import subprocess
 
 # Fix CUDA detection in PyInstaller bundles
 # PyInstaller sometimes doesn't properly detect CUDA libraries
@@ -40,6 +42,16 @@ if getattr(sys, 'frozen', False):
 
 SAMPLE_RATE = 44100
 CHANNELS = 1
+
+# Default output location for trained voices, generated speech, and mic
+# recordings — gitignored, so nothing written by the app lands in the repo.
+if getattr(sys, 'frozen', False):
+    _base_dir = os.path.dirname(sys.executable)
+else:
+    _base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUTPUT_DIR = os.path.join(_base_dir, "local")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+MIC_RECORDING_PATH = os.path.join(OUTPUT_DIR, "mic.wav")
 
 class QwenTTSGUI:
     def __init__(self, root):
@@ -181,7 +193,19 @@ class QwenTTSGUI:
         
         self.text_entry = scrolledtext.ScrolledText(text_frame, height=8, width=50)
         self.text_entry.pack(fill=tk.BOTH, expand=True)
-        
+
+        # Output format selection
+        format_frame = ttk.LabelFrame(self.use_frame, text="Output Format", padding=10)
+        format_frame.pack(fill=tk.X, padx=20, pady=10)
+
+        self.output_format = tk.StringVar(value="wav")
+        ttk.Radiobutton(format_frame, text="WAV", variable=self.output_format,
+                       value="wav").pack(side=tk.LEFT, padx=10)
+        ttk.Radiobutton(format_frame, text="MP3", variable=self.output_format,
+                       value="mp3").pack(side=tk.LEFT, padx=10)
+        ttk.Radiobutton(format_frame, text="M4A", variable=self.output_format,
+                       value="m4a").pack(side=tk.LEFT, padx=10)
+
         # Save location for output
         save_frame = ttk.Frame(self.use_frame)
         save_frame.pack(fill=tk.X, padx=20, pady=10)
@@ -211,25 +235,28 @@ class QwenTTSGUI:
     def browse_voice_file(self):
         filename = filedialog.askopenfilename(
             title="Select Voice File",
+            initialdir=OUTPUT_DIR,
             filetypes=[("PyTorch files", "*.pt"), ("All files", "*.*")]
         )
         if filename:
             self.voice_file_entry.delete(0, tk.END)
             self.voice_file_entry.insert(0, filename)
-    
+
     def browse_save_location_train(self):
         """Browse for save folder when training a voice"""
         folder = filedialog.askdirectory(
-            title="Select Folder to Save Trained Voice"
+            title="Select Folder to Save Trained Voice",
+            initialdir=OUTPUT_DIR
         )
         if folder:
             self.train_save_entry.delete(0, tk.END)
             self.train_save_entry.insert(0, folder)
-    
+
     def browse_save_location_use(self):
         """Browse for save folder when generating speech"""
         folder = filedialog.askdirectory(
-            title="Select Folder to Save Generated Speech"
+            title="Select Folder to Save Generated Speech",
+            initialdir=OUTPUT_DIR
         )
         if folder:
             self.use_save_entry.delete(0, tk.END)
@@ -262,8 +289,8 @@ class QwenTTSGUI:
         
         if self.audio_chunks:
             audio_data = np.concatenate(self.audio_chunks, axis=0)
-            sf.write("mic.wav", audio_data, SAMPLE_RATE)
-            self.record_status_label.config(text="Recording saved to mic.wav", foreground="green")
+            sf.write(MIC_RECORDING_PATH, audio_data, SAMPLE_RATE)
+            self.record_status_label.config(text=f"Recording saved to {MIC_RECORDING_PATH}", foreground="green")
         else:
             self.record_status_label.config(text="No audio recorded", foreground="orange")
         
@@ -383,12 +410,12 @@ class QwenTTSGUI:
                 ref_audio = audio_file
                 
             else:  # recording
-                if not os.path.exists("mic.wav"):
-                    self.root.after(0, lambda: messagebox.showerror("Error", 
+                if not os.path.exists(MIC_RECORDING_PATH):
+                    self.root.after(0, lambda: messagebox.showerror("Error",
                         "Please record audio first using the recording section"))
                     return
-                
-                ref_audio = "mic.wav"
+
+                ref_audio = MIC_RECORDING_PATH
                 ref_text = self.script_text
             
             self.root.after(0, lambda: self.train_status_label.config(
@@ -434,8 +461,8 @@ class QwenTTSGUI:
                 # Use user-specified folder
                 output_file = os.path.join(save_folder, f"{voice_name}.pt")
             else:
-                # Default to current directory with voice name
-                output_file = f"{voice_name}.pt"
+                # Default to the gitignored local output folder
+                output_file = os.path.join(OUTPUT_DIR, f"{voice_name}.pt")
             
             # Create directory if it doesn't exist
             output_dir = os.path.dirname(output_file)
@@ -460,25 +487,32 @@ class QwenTTSGUI:
     def generate_speech(self):
         voice_file = self.voice_file_entry.get().strip()
         text = self.text_entry.get("1.0", tk.END).strip()
-        
+        output_format = self.output_format.get()
+
         if not voice_file:
             messagebox.showerror("Error", "Please select a voice file")
             return
-        
+
         if not text:
             messagebox.showerror("Error", "Please enter text to generate")
             return
-        
+
         if not os.path.exists(voice_file):
             messagebox.showerror("Error", f"Voice file not found: {voice_file}")
             return
-        
+
+        if output_format != "wav" and shutil.which("ffmpeg") is None:
+            messagebox.showerror("Error",
+                f"ffmpeg is required to export {output_format.upper()} but was not found on PATH.\n\n"
+                "Install it (e.g. brew install ffmpeg / apt install ffmpeg) or choose WAV instead.")
+            return
+
         # Run generation in a separate thread
-        thread = threading.Thread(target=self._generate_speech_thread, args=(voice_file, text))
+        thread = threading.Thread(target=self._generate_speech_thread, args=(voice_file, text, output_format))
         thread.daemon = True
         thread.start()
     
-    def _generate_speech_thread(self, voice_file, text):
+    def _generate_speech_thread(self, voice_file, text, output_format="wav"):
         try:
             self.root.after(0, lambda: self.use_status_label.config(
                 text="Loading model...", foreground="blue"))
@@ -594,21 +628,32 @@ class QwenTTSGUI:
             # Determine save location
             save_folder = self.use_save_entry.get().strip()
             voice_name = os.path.splitext(os.path.basename(voice_file))[0]
-            
-            if save_folder:
-                # Use user-specified folder
-                output_file = os.path.join(save_folder, f"{voice_name}_output.wav")
-            else:
-                # Default to current directory with voice name
-                output_file = f"{voice_name}_output.wav"
-            
-            # Create directory if it doesn't exist
-            output_dir = os.path.dirname(output_file)
+
+            output_dir = save_folder if save_folder else OUTPUT_DIR
             if output_dir and not os.path.exists(output_dir):
                 os.makedirs(output_dir, exist_ok=True)
-            
-            # Save output
-            sf.write(output_file, wavs[0], sr)
+
+            output_file = os.path.join(output_dir, f"{voice_name}_output.{output_format}")
+
+            if output_format == "wav":
+                sf.write(output_file, wavs[0], sr)
+            else:
+                # soundfile can't encode mp3/m4a, so write a wav first and hand it to
+                # ffmpeg for the actual encode. generate_speech() already checked
+                # ffmpeg is on PATH before this thread was started.
+                tmp_wav = os.path.join(output_dir, f"{voice_name}_output.tmp.wav")
+                sf.write(tmp_wav, wavs[0], sr)
+                try:
+                    codec = "libmp3lame" if output_format == "mp3" else "aac"
+                    result = subprocess.run(
+                        ["ffmpeg", "-y", "-i", tmp_wav, "-c:a", codec, "-b:a", "192k", output_file],
+                        capture_output=True, text=True
+                    )
+                    if result.returncode != 0:
+                        raise RuntimeError(f"ffmpeg failed to export {output_format.upper()}: {result.stderr}")
+                finally:
+                    if os.path.exists(tmp_wav):
+                        os.remove(tmp_wav)
             
             self.root.after(0, lambda: self.use_status_label.config(
                 text=f"Speech generated successfully! Saved to {output_file}", 

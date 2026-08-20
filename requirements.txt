@@ -3,6 +3,7 @@ numpy
 sounddevice
 soundfile
 Pillow  # Required by transformers/torchvision
+av  # MP3/M4A export in the GUI (bundles its own encoders, no system ffmpeg needed)
 
 # PyTorch (install based on your CUDA version)
 # For CUDA 11.8:

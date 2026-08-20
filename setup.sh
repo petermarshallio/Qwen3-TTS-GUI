@@ -180,6 +180,17 @@ if ! command -v sox >/dev/null 2>&1; then
   fi
 fi
 
+# Needed only for the GUI's MP3/M4A export (WAV output doesn't need it).
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  log "ffmpeg (system binary) not found — attempting to install it automatically ..."
+  install_system_package ffmpeg
+  if command -v ffmpeg >/dev/null 2>&1; then
+    log "ffmpeg installed successfully."
+  else
+    log "Warning: ffmpeg is still not available. Install it manually if you want MP3/M4A export (e.g. brew install ffmpeg); WAV export doesn't need it."
+  fi
+fi
+
 if [[ -d .venv ]]; then
   EXISTING_VER="$(.venv/bin/python -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || echo "")"
   if [[ "$EXISTING_VER" != "$PYTHON_VER" ]]; then
