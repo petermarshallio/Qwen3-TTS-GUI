@@ -159,9 +159,19 @@ source .venv/bin/activate
 log "Upgrading pip ..."
 python -m pip install --upgrade pip
 
+PIN_NUMBA=0.62.1
+
 if [[ "$INTEL_MAC" -eq 1 ]]; then
   log "Installing PyTorch ${PIN_TORCH} (last Intel-macOS build; plain PyPI, no CUDA index) ..."
   pip install "torch==${PIN_TORCH}" "torchvision==${PIN_TORCHVISION}" "torchaudio==${PIN_TORCHAUDIO}"
+
+  # librosa (pulled in by qwen-tts) requires numba, which requires llvmlite. Newer
+  # releases of both dropped Intel-macOS wheels the same way torch did, which would
+  # otherwise force a from-source llvmlite build needing cmake + a matching system
+  # LLVM. Pinning numba here makes pip settle on the last compatible wheel pair
+  # (numba 0.62.1 <-> llvmlite 0.45.1) instead of trying to build the latest.
+  log "Pinning numba==${PIN_NUMBA} (last Intel-macOS wheel; avoids a from-source llvmlite build) ..."
+  pip install "numba==${PIN_NUMBA}"
 elif [[ "$OS" == "Darwin" ]]; then
   # macOS wheels (CPU/MPS, no CUDA variant exists) live on plain PyPI, not the
   # download.pytorch.org/whl/cpu index — that index is for Linux/Windows and its
