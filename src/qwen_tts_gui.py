@@ -317,7 +317,7 @@ class ProgressPanel:
         this particular step will take."""
         self._set_state(index, self.ACTIVE)
         self.bar.config(mode="indeterminate")
-        self.bar.start(12)
+        self.bar.start(80)
 
     def complete_step(self, index):
         """Mark step `index` done and advance the bar to a real, filled fraction."""
@@ -358,6 +358,7 @@ class QwenTTSGUI:
         self.recording = False
         self.audio_chunks = []
         self.recording_map = {}  # filename -> full path, for the current voice's takes
+        self.generate_cancel_event = threading.Event()
 
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -629,12 +630,29 @@ class QwenTTSGUI:
         # Steps are set by generate_speech() before this is called with busy=True —
         # they depend on the parsed [VoiceName] segments, unlike Train's fixed steps.
         if busy:
+            self.generate_cancel_event.clear()
             self.use_progress_panel.show(before=self.use_status_label)
         else:
             self.use_progress_panel.hide()
 
         self._set_frame_enabled(self.use_frame, not busy)
         self.generate_button.config(text="Generating..." if busy else "Generate Speech")
+        # Cancel needs the opposite enabled state to everything else _set_frame_enabled
+        # just touched: available only while busy.
+        self.cancel_button.config(state=tk.NORMAL if busy else tk.DISABLED)
+
+    def cancel_generation(self):
+        """Request cancellation. Generation only checks this between discrete steps
+        (model load, per-voice-group generate, stitch, save) — a step already running
+        is a single blocking model call with no way to interrupt it mid-flight, so
+        cancelling during one takes effect once that step finishes, not instantly."""
+        self.generate_cancel_event.set()
+        self.cancel_button.config(state=tk.DISABLED)
+        self.use_status_label.config(
+            text="Cancelling — finishing the current step (can't be interrupted "
+            "mid-step) before stopping...",
+            foreground="orange",
+        )
 
     def show_success_with_link(self, title, message, file_path):
         """Success dialog with a clickable link that reveals the generated file."""
@@ -912,13 +930,22 @@ class QwenTTSGUI:
         # Generate opens a native Save As dialog (pre-filled with a dated default
         # filename) before starting, rather than writing to a persistent folder path.
         self.last_save_dir = OUTPUT_DIR
+        generate_button_frame = ttk.Frame(self.use_frame)
+        generate_button_frame.pack(pady=20)
         self.generate_button = ttk.Button(
-            self.use_frame,
+            generate_button_frame,
             text="Generate Speech",
             command=self.generate_speech,
             style="Accent.TButton",
         )
-        self.generate_button.pack(pady=20)
+        self.generate_button.pack(side=tk.LEFT, padx=(0, 10))
+        self.cancel_button = ttk.Button(
+            generate_button_frame,
+            text="Cancel",
+            command=self.cancel_generation,
+            state=tk.DISABLED,
+        )
+        self.cancel_button.pack(side=tk.LEFT)
 
     def setup_configure_tab(self):
         """Settings shared across tabs — currently just the device — rather than
@@ -1433,6 +1460,20 @@ class QwenTTSGUI:
 
         return prompt_items[0]
 
+    def _cancelled(self):
+        """Whether cancellation was requested. Only meaningful *between* steps — see
+        `cancel_generation`'s docstring for why a step already running can't stop
+        mid-flight. Also reports it to the status label when true."""
+        if not self.generate_cancel_event.is_set():
+            return False
+        self.root.after(
+            0,
+            lambda: self.use_status_label.config(
+                text="Generation cancelled.", foreground="orange"
+            ),
+        )
+        return True
+
     def _generate_speech_thread(
         self, segments, output_format="wav", language="Auto", output_file=""
     ):
@@ -1464,6 +1505,8 @@ class QwenTTSGUI:
             total_groups = len(kinds_needed)
 
             for group_index, kind in enumerate(kinds_needed):
+                if self._cancelled():
+                    return
                 step = group_index
                 self.root.after(0, lambda i=step: panel.start_step(i))
                 group = groups[kind]
@@ -1585,6 +1628,9 @@ class QwenTTSGUI:
                     wavs_by_index[i] = wav
                 self.root.after(0, lambda i=group_index: panel.complete_step(i))
 
+            if self._cancelled():
+                return
+
             if len(segments) > 1:
                 step = total_groups
                 self.root.after(0, lambda i=step: panel.start_step(i))
@@ -1607,6 +1653,9 @@ class QwenTTSGUI:
 
             if len(segments) > 1:
                 self.root.after(0, lambda i=step: panel.complete_step(i))
+
+            if self._cancelled():
+                return
 
             step = total_groups + (1 if len(segments) > 1 else 0)
             self.root.after(0, lambda i=step: panel.start_step(i))
