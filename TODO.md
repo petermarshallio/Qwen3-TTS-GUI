@@ -1,6 +1,26 @@
 # TODO: qwen-tts feature gaps
 
-- [ ] Allow some kind of placeholder like `[` and `]` to set what voice should be used from a particular point forwards. Then split up generation into tasks, per [VOICE], and compile into a single audio file at the end. The input text box should use the list of available voices to validate before generate happens - with the text box itself (preferably) interactively allowing voice selection when `[` is entered (like an auto-complete).
+A "Configure" tab now exists for settings you'd set once rather than per run (currently
+just device/CUDA selection — disabled when CUDA isn't available, so you can't pick it
+and get repeated "falling back to CPU" warnings). Model size and dtype below belong
+there when implemented.
+
+## Multi-voice generation (`[VoiceName]` markers)
+
+- [x] `[VoiceName]` placeholder switches voice from that point forward; text is split
+      into per-voice segments, generated, and stitched into one output file with a
+      short silence gap at each voice change
+- [x] Mixing preset and custom-cloned voices in the same generation is allowed — each
+      kind's segments are batched into a single `generate_custom_voice` /
+      `generate_voice_clone` call, loading each of Base/CustomVoice at most once
+- [x] Unresolved `[Name]` markers block generate entirely, listing the bad names
+- [x] Typing `[` in the text box pops up a filtered, keyboard-navigable voice picker
+      (Enter/Tab/click inserts `Name]`; Escape/click-away/losing focus erases the
+      abandoned `[partial` text; typing `]` by hand leaves a manually-typed marker as-is)
+
+Simplification: language and the Instruction box stay global controls (applied to
+every segment) rather than per-segment — matches how they already worked before
+markers existed, and nothing so far has asked for per-segment language/instruction.
 
 ## CustomVoice model (preset voices)
 
@@ -42,7 +62,7 @@ before the user has done anything. The 9 names are fixed for this released check
 ## Voice-clone mode (x_vector_only_mode)
 
 - [ ] Expose a checkbox for `x_vector_only_mode` in the Train Voice tab (currently
-      hardcoded to `False` at [qwen_tts_gui.py:458,481](src/qwen_tts_gui.py#L458))
+      hardcoded to `False` at [qwen_tts_gui.py:971](src/qwen_tts_gui.py#L971))
 - [ ] When checked: skip requiring a reference transcript, using speaker-embedding-only
       cloning (faster, lower fidelity)
 
@@ -56,12 +76,12 @@ before the user has done anything. The 9 names are fixed for this released check
   - [ ] `subtalker_*` variants (tokenizer-v2-specific — check whether relevant model
         checkpoints actually use tokenizer v2 before bothering)
 
-## Model size
+## Model size (Configure tab)
 
 - [ ] Offer `0.6B` variants alongside `1.7B` for each model type (faster/lighter,
       same three model types: Base / CustomVoice / VoiceDesign)
 
-## dtype
+## dtype (Configure tab)
 
 - [ ] Add `float16` as a third option alongside the current `bfloat16` (CUDA) /
       `float32` (CPU)

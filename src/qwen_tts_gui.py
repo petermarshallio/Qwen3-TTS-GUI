@@ -1,33 +1,35 @@
+import os
+import re
+import subprocess
+import sys
+import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
-import torch
+from datetime import datetime
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+import av
+import numpy as np
 import sounddevice as sd
 import soundfile as sf
-import numpy as np
-import av
+import torch
 from qwen_tts import Qwen3TTSModel
 from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
-import re
-import threading
-import os
-import sys
-import subprocess
-from datetime import datetime
 
-if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
     # PyInstaller's bundled CUDA DLLs live under _MEIPASS, which isn't on PATH by
     # default — without this, torch.cuda.is_available() reports False in a frozen
     # build even though the DLLs are right there.
-    torch_lib_path = os.path.join(sys._MEIPASS, 'torch', 'lib')
-    current_path = os.environ.get('PATH', '')
+    torch_lib_path = os.path.join(sys._MEIPASS, "torch", "lib")
+    current_path = os.environ.get("PATH", "")
     if os.path.exists(torch_lib_path):
         current_path = torch_lib_path + os.pathsep + current_path
     if sys._MEIPASS not in current_path:
         current_path = sys._MEIPASS + os.pathsep + current_path
-    os.environ['PATH'] = current_path
+    os.environ["PATH"] = current_path
 
     try:
         import torch._C
+
         _ = torch.cuda.is_available()  # re-check now that PATH includes the DLLs
     except Exception:
         pass
@@ -37,7 +39,7 @@ CHANNELS = 1
 
 # Default output location for trained voices, generated speech, and mic
 # recordings — gitignored, so nothing written by the app lands in the repo.
-if getattr(sys, 'frozen', False):
+if getattr(sys, "frozen", False):
     _base_dir = os.path.dirname(sys.executable)
 else:
     _base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -50,10 +52,31 @@ MODEL_REPO_CUSTOM_VOICE = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 # Fixed speaker list for MODEL_REPO_CUSTOM_VOICE (from the model card). Not fetched
 # dynamically via AutoConfig, which would need network/HF-cache access just to
 # populate a dropdown before the user has done anything.
-PRESET_VOICES = ["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee"]
+PRESET_VOICES = [
+    "Vivian",
+    "Serena",
+    "Uncle_Fu",
+    "Dylan",
+    "Eric",
+    "Ryan",
+    "Aiden",
+    "Ono_Anna",
+    "Sohee",
+]
 
-SUPPORTED_LANGUAGES = ["Auto", "Chinese", "English", "Japanese", "Korean", "German",
-                        "French", "Russian", "Portuguese", "Spanish", "Italian"]
+SUPPORTED_LANGUAGES = [
+    "Auto",
+    "Chinese",
+    "English",
+    "Japanese",
+    "Korean",
+    "German",
+    "French",
+    "Russian",
+    "Portuguese",
+    "Spanish",
+    "Italian",
+]
 
 NEW_VOICE_LABEL = "New..."
 
@@ -63,7 +86,9 @@ def list_custom_voices():
     if not os.path.isdir(OUTPUT_DIR):
         return []
     return sorted(
-        os.path.splitext(f)[0] for f in os.listdir(OUTPUT_DIR) if f.lower().endswith(".pt")
+        os.path.splitext(f)[0]
+        for f in os.listdir(OUTPUT_DIR)
+        if f.lower().endswith(".pt")
     )
 
 
@@ -76,7 +101,9 @@ def list_voice_recordings(voice_name):
     if not os.path.isdir(voice_dir):
         return []
     return sorted(
-        os.path.join(voice_dir, f) for f in os.listdir(voice_dir) if f.lower().endswith(".wav")
+        os.path.join(voice_dir, f)
+        for f in os.listdir(voice_dir)
+        if f.lower().endswith(".wav")
     )
 
 
@@ -105,7 +132,7 @@ def parse_voice_segments(text, default_voice, lookup):
     voice = default_voice
     pos = 0
     for match in VOICE_MARKER_RE.finditer(text):
-        chunk = text[pos:match.start()].strip()
+        chunk = text[pos : match.start()].strip()
         if chunk:
             segments.append((voice[0], voice[1], chunk))
 
@@ -128,7 +155,9 @@ def _is_cuda_compat_error(exc):
     """Whether `exc` looks like a CUDA kernel/device compatibility error (as opposed to
     some other RuntimeError) — the case worth silently falling back to CPU for."""
     error_str = str(exc).lower()
-    return "cuda" in error_str and ("kernel" in error_str or "no kernel image" in error_str or "device" in error_str)
+    return "cuda" in error_str and (
+        "kernel" in error_str or "no kernel image" in error_str or "device" in error_str
+    )
 
 
 def encode_audio(samples, sr, output_file, output_format):
@@ -149,7 +178,9 @@ def encode_audio(samples, sr, output_file, output_format):
     stream.layout = layout
     stream.bit_rate = 192000
 
-    frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(data.astype(np.float32)), format="fltp", layout=layout)
+    frame = av.AudioFrame.from_ndarray(
+        np.ascontiguousarray(data.astype(np.float32)), format="fltp", layout=layout
+    )
     frame.sample_rate = sr
 
     for packet in stream.encode(frame):
@@ -178,7 +209,7 @@ class QwenTTSGUI:
         self.root = root
         self.root.title("Qwen3 TTS Voice Training & Generation")
         self.root.geometry("800x1000")
-        
+
         self.device_type = tk.StringVar(value="cuda")
         self.recording = False
         self.audio_chunks = []
@@ -194,6 +225,10 @@ class QwenTTSGUI:
         self.use_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.use_frame, text="Use Voice")
         self.setup_use_tab()
+
+        self.configure_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.configure_frame, text="Configure")
+        self.setup_configure_tab()
 
     # --- Placeholder text + live counters, shared by the Transcript / Text to
     # Generate / Instruction boxes ---
@@ -254,6 +289,7 @@ class QwenTTSGUI:
 
     def bind_text_counter(self, widget, label):
         """Keep `label` showing a live character/word count for `widget` (placeholder-aware)."""
+
         def update(event=None):
             content = self.get_text_value(widget)
             words = len(content.split()) if content else 0
@@ -281,8 +317,11 @@ class QwenTTSGUI:
         def close_popup(abandoned=False):
             if state["popup"] is None:
                 return
-            if abandoned and MARK in text_widget.mark_names() and \
-                    text_widget.compare("insert", ">=", MARK):
+            if (
+                abandoned
+                and MARK in text_widget.mark_names()
+                and text_widget.compare("insert", ">=", MARK)
+            ):
                 text_widget.delete(MARK, "insert")
             state["popup"].destroy()
             state["popup"] = None
@@ -295,8 +334,9 @@ class QwenTTSGUI:
 
         def refresh_listbox():
             filter_text = current_filter().strip().lower()
-            matches = [n for n in state["names"] if n.lower().startswith(filter_text)] or \
-                [n for n in state["names"] if filter_text in n.lower()]
+            matches = [
+                n for n in state["names"] if n.lower().startswith(filter_text)
+            ] or [n for n in state["names"] if filter_text in n.lower()]
             listbox = state["listbox"]
             listbox.delete(0, tk.END)
             for name in matches:
@@ -340,8 +380,14 @@ class QwenTTSGUI:
             # corners, which otherwise visually clip the first/last row.
             frame = tk.Frame(popup, borderwidth=1, relief=tk.SOLID)
             frame.pack(padx=1, pady=1)
-            listbox = tk.Listbox(frame, height=6, width=width, exportselection=False,
-                                  highlightthickness=0, borderwidth=0)
+            listbox = tk.Listbox(
+                frame,
+                height=6,
+                width=width,
+                exportselection=False,
+                highlightthickness=0,
+                borderwidth=0,
+            )
             listbox.pack(padx=4, pady=4)
             listbox.bind("<ButtonRelease-1>", lambda e: confirm_selection())
             state["popup"] = popup
@@ -351,7 +397,8 @@ class QwenTTSGUI:
             if bbox:
                 x, y, _, h = bbox
                 popup.wm_geometry(
-                    f"+{text_widget.winfo_rootx() + x}+{text_widget.winfo_rooty() + y + h}")
+                    f"+{text_widget.winfo_rootx() + x}+{text_widget.winfo_rooty() + y + h}"
+                )
             refresh_listbox()
 
         def on_key_release(event):
@@ -415,7 +462,9 @@ class QwenTTSGUI:
 
     def set_train_busy(self, busy):
         if busy:
-            self.train_progress.pack(fill=tk.X, padx=20, pady=(0, 10), before=self.train_status_label)
+            self.train_progress.pack(
+                fill=tk.X, padx=20, pady=(0, 10), before=self.train_status_label
+            )
             self.train_progress.start(10)
         else:
             self.train_progress.stop()
@@ -430,7 +479,9 @@ class QwenTTSGUI:
 
     def set_use_busy(self, busy):
         if busy:
-            self.use_progress.pack(fill=tk.X, padx=20, pady=(0, 10), before=self.use_status_label)
+            self.use_progress.pack(
+                fill=tk.X, padx=20, pady=(0, 10), before=self.use_status_label
+            )
             self.use_progress.start(10)
         else:
             self.use_progress.stop()
@@ -449,10 +500,19 @@ class QwenTTSGUI:
         dialog.resizable(False, False)
         dialog.transient(self.root)
 
-        ttk.Label(dialog, text=message, wraplength=400, justify=tk.LEFT).pack(padx=20, pady=(20, 10))
+        ttk.Label(dialog, text=message, wraplength=400, justify=tk.LEFT).pack(
+            padx=20, pady=(20, 10)
+        )
 
-        link = ttk.Label(dialog, text=file_path, foreground="blue", cursor="hand2",
-                          font=("TkDefaultFont", 10, "underline"), wraplength=400, justify=tk.LEFT)
+        link = ttk.Label(
+            dialog,
+            text=file_path,
+            foreground="blue",
+            cursor="hand2",
+            font=("TkDefaultFont", 10, "underline"),
+            wraplength=400,
+            justify=tk.LEFT,
+        )
         link.pack(padx=20, pady=(0, 10))
         link.bind("<Button-1>", lambda e: reveal_in_file_manager(file_path))
 
@@ -460,10 +520,11 @@ class QwenTTSGUI:
         dialog.grab_set()
 
     def setup_train_tab(self):
-        # Title
-        title_label = ttk.Label(self.train_frame, text="Train a New Voice", font=("Arial", 16, "bold"))
+        title_label = ttk.Label(
+            self.train_frame, text="Train a New Voice", font=("Arial", 16, "bold")
+        )
         title_label.pack(pady=10)
-        
+
         # Voice picker: "New..." to create a voice, or an existing custom voice to
         # re-train/overwrite it. Presets aren't shown here — they aren't trainable.
         voice_frame = ttk.Frame(self.train_frame)
@@ -471,7 +532,9 @@ class QwenTTSGUI:
         ttk.Label(voice_frame, text="Voice:").pack(side=tk.LEFT, padx=5)
         self.train_voice_combo = ttk.Combobox(voice_frame, width=27, state="readonly")
         self.train_voice_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        self.train_voice_combo.bind("<<ComboboxSelected>>", lambda e: self.on_train_voice_selected())
+        self.train_voice_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self.on_train_voice_selected()
+        )
 
         name_frame = ttk.Frame(self.train_frame)
         name_frame.pack(fill=tk.X, padx=20, pady=10)
@@ -480,63 +543,86 @@ class QwenTTSGUI:
         self.voice_name_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         # Recordings are filed under this name (local/{name}/mic_*.wav), so the
         # recording picker below needs to follow it as the user types.
-        self.voice_name_entry.bind("<KeyRelease>", lambda e: self.refresh_recording_list(), add="+")
+        self.voice_name_entry.bind(
+            "<KeyRelease>", lambda e: self.refresh_recording_list(), add="+"
+        )
 
-        # Device selection
-        device_frame = ttk.LabelFrame(self.train_frame, text="Device Selection", padding=10)
-        device_frame.pack(fill=tk.X, padx=20, pady=10)
-        
-        ttk.Radiobutton(device_frame, text="CUDA (GPU)", variable=self.device_type, 
-                       value="cuda").pack(side=tk.LEFT, padx=10)
-        ttk.Radiobutton(device_frame, text="CPU", variable=self.device_type, 
-                       value="cpu").pack(side=tk.LEFT, padx=10)
-        
-        # Training method selection
-        method_frame = ttk.LabelFrame(self.train_frame, text="Training Method", padding=10)
+        method_frame = ttk.LabelFrame(
+            self.train_frame, text="Training Method", padding=10
+        )
         method_frame.pack(fill=tk.X, padx=20, pady=10)
-        
+
         self.train_method = tk.StringVar(value="file")
-        ttk.Radiobutton(method_frame, text="From Audio File + Transcript",
-                       variable=self.train_method, value="file",
-                       command=self.update_train_method_visibility).pack(anchor=tk.W, pady=5)
-        ttk.Radiobutton(method_frame, text="Record Audio (Pre-made Script)",
-                       variable=self.train_method, value="record",
-                       command=self.update_train_method_visibility).pack(anchor=tk.W, pady=5)
+        ttk.Radiobutton(
+            method_frame,
+            text="From Audio File + Transcript",
+            variable=self.train_method,
+            value="file",
+            command=self.update_train_method_visibility,
+        ).pack(anchor=tk.W, pady=5)
+        ttk.Radiobutton(
+            method_frame,
+            text="Record Audio (Pre-made Script)",
+            variable=self.train_method,
+            value="record",
+            command=self.update_train_method_visibility,
+        ).pack(anchor=tk.W, pady=5)
 
         # File input section (shown only for the "file" method)
-        self.file_frame = ttk.LabelFrame(self.train_frame, text="File Input", padding=10)
+        self.file_frame = ttk.LabelFrame(
+            self.train_frame, text="File Input", padding=10
+        )
 
         audio_file_frame = ttk.Frame(self.file_frame)
         audio_file_frame.pack(fill=tk.X, pady=5)
         ttk.Label(audio_file_frame, text="Audio File:").pack(side=tk.LEFT, padx=5)
         self.audio_file_entry = ttk.Entry(audio_file_frame, width=40)
         self.audio_file_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ttk.Button(audio_file_frame, text="Browse", command=self.browse_audio_file).pack(side=tk.LEFT, padx=5)
-        
+        ttk.Button(
+            audio_file_frame, text="Browse", command=self.browse_audio_file
+        ).pack(side=tk.LEFT, padx=5)
+
         transcript_frame = ttk.Frame(self.file_frame)
         transcript_frame.pack(fill=tk.X, pady=5)
         ttk.Label(transcript_frame, text="Transcript:").pack(anchor=tk.W, padx=5)
-        self.transcript_entry = scrolledtext.ScrolledText(transcript_frame, height=4, width=50, wrap=tk.WORD)
+        self.transcript_entry = scrolledtext.ScrolledText(
+            transcript_frame, height=4, width=50, wrap=tk.WORD
+        )
         self.transcript_entry.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.add_placeholder_text(self.transcript_entry, "Enter the exact transcript of the reference audio...")
-        self.transcript_counter_label = ttk.Label(transcript_frame, text="", foreground="gray")
+        self.add_placeholder_text(
+            self.transcript_entry,
+            "Enter the exact transcript of the reference audio...",
+        )
+        self.transcript_counter_label = ttk.Label(
+            transcript_frame, text="", foreground="gray"
+        )
         self.transcript_counter_label.pack(anchor=tk.E, padx=5)
         self.bind_text_counter(self.transcript_entry, self.transcript_counter_label)
 
         # Recording section (shown only for the "record" method)
-        self.record_frame = ttk.LabelFrame(self.train_frame, text="Recording", padding=10)
+        self.record_frame = ttk.LabelFrame(
+            self.train_frame, text="Recording", padding=10
+        )
 
         self.script_text = "On a warm Saturday morning, the quick brown fox jumped over several lazy dogs while distant musicians played jazzy tunes near the quiet park. People checked their phones, argued about numbers, dates, and prices, and casually mentioned names like Alex, Jordan, and Taylor. A cyclist shouted warnings, a train horn echoed, and someone asked, ‘Why does this even matter?’ as rain began falling lightly at exactly 9:47 a.m., changing plans, moods, and expectations all at once."
-        ttk.Label(self.record_frame, text="Script to read:", font=("Arial", 10, "bold")).pack(anchor=tk.W, pady=5)
-        script_display = scrolledtext.ScrolledText(self.record_frame, height=7, width=50, wrap=tk.WORD)
+        ttk.Label(
+            self.record_frame, text="Script to read:", font=("Arial", 10, "bold")
+        ).pack(anchor=tk.W, pady=5)
+        script_display = scrolledtext.ScrolledText(
+            self.record_frame, height=7, width=50, wrap=tk.WORD
+        )
         script_display.insert("1.0", self.script_text)
         script_display.config(state=tk.DISABLED)
         script_display.pack(fill=tk.X, pady=5)
 
-        self.record_status_label = ttk.Label(self.record_frame, text="Ready to record", foreground="green")
+        self.record_status_label = ttk.Label(
+            self.record_frame, text="Ready to record", foreground="green"
+        )
         self.record_status_label.pack(pady=5)
 
-        self.record_button = ttk.Button(self.record_frame, text="Start Recording", command=self.toggle_recording)
+        self.record_button = ttk.Button(
+            self.record_frame, text="Start Recording", command=self.toggle_recording
+        )
         self.record_button.pack(pady=5)
 
         # Every take is kept (local/{voice}/mic_{timestamp}.wav) rather than
@@ -547,16 +633,20 @@ class QwenTTSGUI:
         self.recording_combo = ttk.Combobox(take_frame, width=30, state="disabled")
         self.recording_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
 
-        # Status and progress
-        self.train_status_label = ttk.Label(self.train_frame, text="", foreground="blue")
+        self.train_status_label = ttk.Label(
+            self.train_frame, text="", foreground="blue"
+        )
         self.train_status_label.pack(pady=10)
 
         self.train_progress = ttk.Progressbar(self.train_frame, mode="indeterminate")
         # Not packed here — shown only while training is in progress (set_train_busy).
 
-        # Train button
-        self.train_button = ttk.Button(self.train_frame, text="Train Voice", command=self.train_voice,
-                                 style="Accent.TButton")
+        self.train_button = ttk.Button(
+            self.train_frame,
+            text="Train Voice",
+            command=self.train_voice,
+            style="Accent.TButton",
+        )
         self.train_button.pack(pady=20)
 
         self.update_train_method_visibility()
@@ -566,10 +656,14 @@ class QwenTTSGUI:
         """Show only the File Input or Recording section, matching the selected training method."""
         if self.train_method.get() == "file":
             self.record_frame.pack_forget()
-            self.file_frame.pack(fill=tk.X, padx=20, pady=10, before=self.train_status_label)
+            self.file_frame.pack(
+                fill=tk.X, padx=20, pady=10, before=self.train_status_label
+            )
         else:
             self.file_frame.pack_forget()
-            self.record_frame.pack(fill=tk.X, padx=20, pady=10, before=self.train_status_label)
+            self.record_frame.pack(
+                fill=tk.X, padx=20, pady=10, before=self.train_status_label
+            )
 
     def refresh_train_voice_list(self):
         """Repopulate the Train tab's voice picker from the local voice cache."""
@@ -597,7 +691,9 @@ class QwenTTSGUI:
         whenever that name changes, and after every new recording (which always
         becomes the selection)."""
         voice_name = self.voice_name_entry.get().strip()
-        self.recording_map = {os.path.basename(p): p for p in list_voice_recordings(voice_name)}
+        self.recording_map = {
+            os.path.basename(p): p for p in list_voice_recordings(voice_name)
+        }
         values = list(self.recording_map.keys())
         self.recording_combo["values"] = values
         if values:
@@ -614,10 +710,13 @@ class QwenTTSGUI:
         self.refresh_use_voice_list()
 
     def setup_use_tab(self):
-        # Title
-        title_label = ttk.Label(self.use_frame, text="Generate Speech from a pretrained Voice", font=("Arial", 16, "bold"))
+        title_label = ttk.Label(
+            self.use_frame,
+            text="Generate Speech from a pretrained Voice",
+            font=("Arial", 16, "bold"),
+        )
         title_label.pack(pady=10)
-        
+
         # Voice selection: custom voices from the local cache + read-only presets
         voice_frame = ttk.LabelFrame(self.use_frame, text="Voice Selection", padding=10)
         voice_frame.pack(fill=tk.X, padx=20, pady=10)
@@ -625,15 +724,20 @@ class QwenTTSGUI:
         voice_select_frame = ttk.Frame(voice_frame)
         voice_select_frame.pack(fill=tk.X, pady=5)
         ttk.Label(voice_select_frame, text="Voice:").pack(side=tk.LEFT, padx=5)
-        self.use_voice_combo = ttk.Combobox(voice_select_frame, width=37, state="readonly")
+        self.use_voice_combo = ttk.Combobox(
+            voice_select_frame, width=37, state="readonly"
+        )
         self.use_voice_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        self.use_voice_combo.bind("<<ComboboxSelected>>", lambda e: self.on_use_voice_selected())
+        self.use_voice_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self.on_use_voice_selected()
+        )
 
         language_frame = ttk.Frame(voice_frame)
         language_frame.pack(fill=tk.X, pady=5)
         ttk.Label(language_frame, text="Language:").pack(side=tk.LEFT, padx=5)
-        self.use_language_combo = ttk.Combobox(language_frame, width=37, state="readonly",
-                                                values=SUPPORTED_LANGUAGES)
+        self.use_language_combo = ttk.Combobox(
+            language_frame, width=37, state="readonly", values=SUPPORTED_LANGUAGES
+        )
         self.use_language_combo.set("Auto")
         self.use_language_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
 
@@ -648,26 +752,23 @@ class QwenTTSGUI:
         self.add_placeholder_entry(self.instruct_entry, "e.g. say it in an angry tone")
         # add_placeholder_entry's own FocusOut always restores the placeholder text it
         # was given above; re-run afterwards so the hint matches the current voice kind.
-        self.instruct_entry.bind("<FocusOut>", lambda e: self.on_use_voice_selected(), add="+")
+        self.instruct_entry.bind(
+            "<FocusOut>", lambda e: self.on_use_voice_selected(), add="+"
+        )
 
-        # Device selection
-        device_frame = ttk.LabelFrame(self.use_frame, text="Device Selection", padding=10)
-        device_frame.pack(fill=tk.X, padx=20, pady=10)
-
-        self.use_device_type = tk.StringVar(value="cuda")
-        ttk.Radiobutton(device_frame, text="CUDA (GPU)", variable=self.use_device_type,
-                       value="cuda").pack(side=tk.LEFT, padx=10)
-        ttk.Radiobutton(device_frame, text="CPU", variable=self.use_device_type,
-                       value="cpu").pack(side=tk.LEFT, padx=10)
-
-        # Text input
         text_frame = ttk.LabelFrame(self.use_frame, text="Text to Generate", padding=10)
         text_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
 
-        ttk.Label(text_frame, text="Tip: type [VoiceName] to switch voices from that "
-                  "point on — try typing '['.", foreground="gray").pack(anchor=tk.W, pady=(0, 5))
+        ttk.Label(
+            text_frame,
+            text="Tip: type [VoiceName] to switch voices from that "
+            "point on — try typing '['.",
+            foreground="gray",
+        ).pack(anchor=tk.W, pady=(0, 5))
 
-        self.text_entry = scrolledtext.ScrolledText(text_frame, height=8, width=50, wrap=tk.WORD)
+        self.text_entry = scrolledtext.ScrolledText(
+            text_frame, height=8, width=50, wrap=tk.WORD
+        )
         self.text_entry.pack(fill=tk.BOTH, expand=True)
         self.add_placeholder_text(self.text_entry, "Enter text to synthesize...")
         self.text_counter_label = ttk.Label(text_frame, text="", foreground="gray")
@@ -675,41 +776,77 @@ class QwenTTSGUI:
         self.bind_text_counter(self.text_entry, self.text_counter_label)
         self.setup_voice_autocomplete(self.text_entry)
 
-        # Output format selection
         format_frame = ttk.LabelFrame(self.use_frame, text="Output Format", padding=10)
         format_frame.pack(fill=tk.X, padx=20, pady=10)
 
         self.output_format = tk.StringVar(value="wav")
-        ttk.Radiobutton(format_frame, text="WAV", variable=self.output_format,
-                       value="wav").pack(side=tk.LEFT, padx=10)
-        ttk.Radiobutton(format_frame, text="MP3", variable=self.output_format,
-                       value="mp3").pack(side=tk.LEFT, padx=10)
-        ttk.Radiobutton(format_frame, text="M4A", variable=self.output_format,
-                       value="m4a").pack(side=tk.LEFT, padx=10)
+        ttk.Radiobutton(
+            format_frame, text="WAV", variable=self.output_format, value="wav"
+        ).pack(side=tk.LEFT, padx=10)
+        ttk.Radiobutton(
+            format_frame, text="MP3", variable=self.output_format, value="mp3"
+        ).pack(side=tk.LEFT, padx=10)
+        ttk.Radiobutton(
+            format_frame, text="M4A", variable=self.output_format, value="m4a"
+        ).pack(side=tk.LEFT, padx=10)
 
-        # Save location for output
         save_frame = ttk.Frame(self.use_frame)
         save_frame.pack(fill=tk.X, padx=20, pady=10)
         ttk.Label(save_frame, text="Save Location:").pack(side=tk.LEFT, padx=5)
         self.use_save_entry = ttk.Entry(save_frame, width=40)
         self.use_save_entry.insert(0, OUTPUT_DIR)
         self.use_save_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ttk.Button(save_frame, text="Browse", command=self.browse_save_location_use).pack(side=tk.LEFT, padx=5)
-        
-        # Status
+        ttk.Button(
+            save_frame, text="Browse", command=self.browse_save_location_use
+        ).pack(side=tk.LEFT, padx=5)
+
         self.use_status_label = ttk.Label(self.use_frame, text="", foreground="blue")
         self.use_status_label.pack(pady=10)
 
         self.use_progress = ttk.Progressbar(self.use_frame, mode="indeterminate")
         # Not packed here — shown only while generation is in progress (set_use_busy).
 
-        # Generate button
-        self.generate_button = ttk.Button(self.use_frame, text="Generate Speech", command=self.generate_speech,
-                                    style="Accent.TButton")
+        self.generate_button = ttk.Button(
+            self.use_frame,
+            text="Generate Speech",
+            command=self.generate_speech,
+            style="Accent.TButton",
+        )
         self.generate_button.pack(pady=20)
 
         self.use_voice_map = {}
         self.refresh_use_voice_list()
+
+    def setup_configure_tab(self):
+        """Settings shared across tabs — currently just the device — rather than
+        per-run choices repeated on every tab."""
+        title_label = ttk.Label(
+            self.configure_frame, text="Configuration", font=("Arial", 16, "bold")
+        )
+        title_label.pack(pady=10)
+
+        device_frame = ttk.LabelFrame(self.configure_frame, text="Device", padding=10)
+        device_frame.pack(fill=tk.X, padx=20, pady=10)
+
+        cuda_radio = ttk.Radiobutton(
+            device_frame, text="CUDA (GPU)", variable=self.device_type, value="cuda"
+        )
+        cuda_radio.pack(side=tk.LEFT, padx=10)
+        ttk.Radiobutton(
+            device_frame, text="CPU", variable=self.device_type, value="cpu"
+        ).pack(side=tk.LEFT, padx=10)
+
+        if not torch.cuda.is_available():
+            # Disabled rather than left selectable-but-warned: picking CUDA when
+            # it's not there just re-triggers the same "falling back to CPU"
+            # dialog on every model load.
+            cuda_radio.config(state=tk.DISABLED)
+            self.device_type.set("cpu")
+            ttk.Label(
+                device_frame,
+                text="(CUDA not available on this machine)",
+                foreground="gray",
+            ).pack(side=tk.LEFT, padx=10)
 
     def refresh_use_voice_list(self):
         """Repopulate the Use tab's voice picker with local custom voices + presets."""
@@ -742,8 +879,11 @@ class QwenTTSGUI:
         entry = self.instruct_entry
         entry.config(state=tk.NORMAL)
 
-        hint = "e.g. say it in an angry tone" if kind == "preset" else \
-            "Only applies to preset voices, incl. any [VoiceName] segments."
+        hint = (
+            "e.g. say it in an angry tone"
+            if kind == "preset"
+            else "Only applies to preset voices, incl. any [VoiceName] segments."
+        )
         if getattr(entry, "showing_placeholder", False):
             entry.delete(0, tk.END)
             entry.insert(0, hint)
@@ -752,28 +892,27 @@ class QwenTTSGUI:
     def browse_audio_file(self):
         filename = filedialog.askopenfilename(
             title="Select Audio File",
-            filetypes=[("WAV files", "*.wav"), ("All files", "*.*")]
+            filetypes=[("WAV files", "*.wav"), ("All files", "*.*")],
         )
         if filename:
             self.audio_file_entry.delete(0, tk.END)
             self.audio_file_entry.insert(0, filename)
-    
+
     def browse_save_location_use(self):
         """Browse for save folder when generating speech"""
         folder = filedialog.askdirectory(
-            title="Select Folder to Save Generated Speech",
-            initialdir=OUTPUT_DIR
+            title="Select Folder to Save Generated Speech", initialdir=OUTPUT_DIR
         )
         if folder:
             self.use_save_entry.delete(0, tk.END)
             self.use_save_entry.insert(0, folder)
-    
+
     def toggle_recording(self):
         if not self.recording:
             self.start_recording()
         else:
             self.stop_recording()
-    
+
     def start_recording(self):
         if not self.voice_name_entry.get().strip():
             messagebox.showerror("Error", "Please enter a voice name before recording")
@@ -781,22 +920,26 @@ class QwenTTSGUI:
 
         self.recording = True
         self.audio_chunks = []
-        self.record_status_label.config(text="Recording... Press Stop to finish", foreground="red")
+        self.record_status_label.config(
+            text="Recording... Press Stop to finish", foreground="red"
+        )
         self.record_button.config(text="Stop Recording")
-        
+
         def callback(indata, frames, time, status):
             if self.recording:
                 self.audio_chunks.append(indata.copy())
-        
-        self.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, callback=callback)
+
+        self.stream = sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=CHANNELS, callback=callback
+        )
         self.stream.start()
-    
+
     def stop_recording(self):
         self.recording = False
-        if hasattr(self, 'stream'):
+        if hasattr(self, "stream"):
             self.stream.stop()
             self.stream.close()
-        
+
         if self.audio_chunks:
             voice_name = self.voice_name_entry.get().strip()
             voice_dir = os.path.join(OUTPUT_DIR, voice_name)
@@ -807,85 +950,130 @@ class QwenTTSGUI:
             recording_path = os.path.join(voice_dir, f"mic_{timestamp}.wav")
             sf.write(recording_path, audio_data, SAMPLE_RATE)
             self.refresh_recording_list()  # new take always becomes the selection
-            self.record_status_label.config(text=f"Recording saved to {recording_path}", foreground="green")
+            self.record_status_label.config(
+                text=f"Recording saved to {recording_path}", foreground="green"
+            )
         else:
-            self.record_status_label.config(text="No audio recorded", foreground="orange")
-        
+            self.record_status_label.config(
+                text="No audio recorded", foreground="orange"
+            )
+
         self.record_button.config(text="Start Recording")
-    
+
     def get_model_config(self, device_type, show_warning=True):
-        """Get model configuration based on device type"""
-        # Check if CUDA is requested but not available
+        """Build `Qwen3TTSModel.from_pretrained` kwargs for the given device.
+
+        Falls back to CPU if `device_type` is "cuda" but CUDA isn't actually
+        available.
+
+        Args:
+            device_type: "cuda" or "cpu".
+            show_warning: Whether to show a dialog when falling back from cuda to cpu.
+
+        Returns:
+            A dict of device_map/dtype/attn_implementation kwargs.
+        """
         if device_type == "cuda" and not torch.cuda.is_available():
-            # Provide detailed diagnostic information
             cuda_info = []
             cuda_info.append(f"PyTorch version: {torch.__version__}")
             cuda_info.append(f"CUDA available: {torch.cuda.is_available()}")
-            if hasattr(torch.version, 'cuda'):
+            if hasattr(torch.version, "cuda"):
                 cuda_info.append(f"PyTorch CUDA version: {torch.version.cuda}")
-            if hasattr(sys, '_MEIPASS'):
-                cuda_info.append(f"Running as bundled executable")
-                torch_lib = os.path.join(sys._MEIPASS, 'torch', 'lib')
+            if hasattr(sys, "_MEIPASS"):
+                cuda_info.append("Running as bundled executable")
+                torch_lib = os.path.join(sys._MEIPASS, "torch", "lib")
                 cuda_info.append(f"Torch lib path exists: {os.path.exists(torch_lib)}")
             else:
-                cuda_info.append(f"Running as Python script")
-            
+                cuda_info.append("Running as Python script")
+
             if show_warning:
-                info_msg = "CUDA is not available. Falling back to CPU mode.\n\n" + "\n".join(cuda_info)
-                self.root.after(0, lambda: messagebox.showwarning(
-                    "CUDA Not Available", info_msg))
+                info_msg = (
+                    "CUDA is not available. Falling back to CPU mode.\n\n"
+                    + "\n".join(cuda_info)
+                )
+                self.root.after(
+                    0, lambda: messagebox.showwarning("CUDA Not Available", info_msg)
+                )
             device_type = "cpu"
-        
-        # Return CUDA config if CUDA is available and requested
+
         if device_type == "cuda" and torch.cuda.is_available():
-            # Try flash_attention_2, fallback to sdpa if not available
+            # flash_attn is an optional dependency; sdpa works everywhere torch does.
+            # A full import (not just importlib.util.find_spec) so a present-but-broken
+            # install (e.g. compiled against a mismatched CUDA/torch) falls back too.
             try:
-                import flash_attn
+                import flash_attn  # noqa: F401
+
                 attn_impl = "flash_attention_2"
             except ImportError:
                 attn_impl = "sdpa"
-            
+
             return {
                 "device_map": "auto",
                 "dtype": torch.bfloat16,
                 "attn_implementation": attn_impl,
             }
-        else:
-            # CPU configuration
-            return {
-                "device_map": "cpu",
-                "dtype": torch.float32,
-                "attn_implementation": "eager",
-            }
+        return {
+            "device_map": "cpu",
+            "dtype": torch.float32,
+            "attn_implementation": "eager",
+        }
 
-    def _load_model(self, model_repo, device_type, show_warning=True, status_label=None):
-        """Load `model_repo`, falling back to CPU and retrying once on a CUDA
-        kernel/device compatibility error. Returns (model, effective_device_type)."""
+    def _load_model(
+        self, model_repo, device_type, show_warning=True, status_label=None
+    ):
+        """Load `model_repo`, falling back to CPU once on a CUDA compat error.
+
+        Args:
+            model_repo: HuggingFace repo id to load.
+            device_type: "cuda" or "cpu".
+            show_warning: Passed through to `get_model_config`.
+            status_label: If given, updated with a fallback message on retry.
+
+        Returns:
+            A (model, effective_device_type) tuple — `effective_device_type` is
+            "cpu" if a CUDA compatibility error forced a fallback.
+        """
         config = self.get_model_config(device_type, show_warning=show_warning)
         try:
             return Qwen3TTSModel.from_pretrained(model_repo, **config), device_type
         except (RuntimeError, torch.cuda.CudaError) as cuda_error:
             if not _is_cuda_compat_error(cuda_error):
                 raise
+            # Python clears the `as` binding once this except block exits, so capture
+            # the message now — the messagebox lambda below runs later, via root.after.
+            error_text = str(cuda_error)
             if status_label is not None:
-                self.root.after(0, lambda: status_label.config(
-                    text="CUDA error detected, falling back to CPU...", foreground="orange"))
-            self.root.after(0, lambda: messagebox.showwarning(
-                "CUDA Compatibility Issue",
-                f"CUDA error detected: {cuda_error}\n\nFalling back to CPU mode. This may be slower."))
+                self.root.after(
+                    0,
+                    lambda: status_label.config(
+                        text="CUDA error detected, falling back to CPU...",
+                        foreground="orange",
+                    ),
+                )
+            self.root.after(
+                0,
+                lambda: messagebox.showwarning(
+                    "CUDA Compatibility Issue",
+                    f"CUDA error detected: {error_text}\n\nFalling back to CPU mode. This may be slower.",
+                ),
+            )
             config = self.get_model_config("cpu", show_warning=False)
             return Qwen3TTSModel.from_pretrained(model_repo, **config), "cpu"
 
     def train_voice(self):
+        """Validate the Train Voice form and kick off `_train_voice_thread`."""
         voice_name = self.voice_name_entry.get().strip()
         if not voice_name:
             messagebox.showerror("Error", "Please enter a voice name")
             return
 
-        if self.train_voice_combo.get() == NEW_VOICE_LABEL and voice_name in list_custom_voices():
+        if (
+            self.train_voice_combo.get() == NEW_VOICE_LABEL
+            and voice_name in list_custom_voices()
+        ):
             if not messagebox.askyesno(
                 "Overwrite Voice?",
-                f"A voice named '{voice_name}' already exists. Overwrite it?"
+                f"A voice named '{voice_name}' already exists. Overwrite it?",
             ):
                 return
 
@@ -898,136 +1086,157 @@ class QwenTTSGUI:
 
         self.set_train_busy(True)
 
-        # Run training in a separate thread to avoid blocking UI
         thread = threading.Thread(
             target=self._train_voice_thread,
-            args=(voice_name, method, device_type, recording_path))
+            args=(voice_name, method, device_type, recording_path),
+        )
         thread.daemon = True
         thread.start()
 
     def _train_voice_thread(self, voice_name, method, device_type, recording_path=None):
+        """Build and save a VoiceClonePromptItem for `voice_name` (background thread).
+
+        Args:
+            voice_name: Name to save the trained voice under (OUTPUT_DIR/{voice_name}.pt).
+            method: "file" (audio_file_entry + transcript_entry) or "record"
+                (recording_path + the fixed read-aloud script).
+            device_type: "cuda" or "cpu".
+            recording_path: Recorded take to use, when method == "record".
+        """
         try:
-            self.root.after(0, lambda: self.train_status_label.config(
-                text="Loading model...", foreground="blue"))
+            self.root.after(
+                0,
+                lambda: self.train_status_label.config(
+                    text="Loading model...", foreground="blue"
+                ),
+            )
+            model, device_type = self._load_model(
+                MODEL_REPO_BASE, device_type, status_label=self.train_status_label
+            )
 
-            # Load model
-            config = self.get_model_config(device_type, show_warning=True)
-            try:
-                model = Qwen3TTSModel.from_pretrained(
-                    MODEL_REPO_BASE,
-                    **config
-                )
-            except (RuntimeError, torch.cuda.CudaError) as cuda_error:
-                # Check if it's a CUDA compatibility error
-                error_str = str(cuda_error).lower()
-                if "cuda" in error_str and ("kernel" in error_str or "no kernel image" in error_str or "device" in error_str):
-                    # CUDA error - fall back to CPU
-                    device_type = "cpu"  # Update device_type for fallback
-                    self.root.after(0, lambda: self.train_status_label.config(
-                        text="CUDA error detected, falling back to CPU...", foreground="orange"))
-                    self.root.after(0, lambda: messagebox.showwarning(
-                        "CUDA Compatibility Issue",
-                        f"CUDA error detected: {str(cuda_error)}\n\nFalling back to CPU mode. Training may be slower."))
-                    # Retry with CPU config
-                    config = self.get_model_config("cpu", show_warning=False)
-                    model = Qwen3TTSModel.from_pretrained(
-                        MODEL_REPO_BASE,
-                        **config
-                    )
-                else:
-                    # Re-raise if it's not a CUDA compatibility error
-                    raise
-
-            ref_audio = None
-            ref_text = None
-            
             if method == "file":
                 audio_file = self.audio_file_entry.get().strip()
                 ref_text = self.get_text_value(self.transcript_entry)
-                
+
                 if not audio_file:
-                    self.root.after(0, lambda: messagebox.showerror("Error", "Please select an audio file"))
+                    self.root.after(
+                        0,
+                        lambda: messagebox.showerror(
+                            "Error", "Please select an audio file"
+                        ),
+                    )
                     return
-                
+
                 if not ref_text:
-                    self.root.after(0, lambda: messagebox.showerror("Error", "Please enter a transcript"))
+                    self.root.after(
+                        0,
+                        lambda: messagebox.showerror(
+                            "Error", "Please enter a transcript"
+                        ),
+                    )
                     return
-                
+
                 if not os.path.exists(audio_file):
-                    self.root.after(0, lambda: messagebox.showerror("Error", f"Audio file not found: {audio_file}"))
+                    self.root.after(
+                        0,
+                        lambda: messagebox.showerror(
+                            "Error", f"Audio file not found: {audio_file}"
+                        ),
+                    )
                     return
-                
+
                 ref_audio = audio_file
-                
+
             else:  # recording
                 if not recording_path or not os.path.exists(recording_path):
-                    self.root.after(0, lambda: messagebox.showerror("Error",
-                        "Please record audio first using the recording section"))
+                    self.root.after(
+                        0,
+                        lambda: messagebox.showerror(
+                            "Error",
+                            "Please record audio first using the recording section",
+                        ),
+                    )
                     return
 
                 ref_audio = recording_path
                 ref_text = self.script_text
-            
-            self.root.after(0, lambda: self.train_status_label.config(
-                text="Creating voice clone prompt...", foreground="blue"))
-            
-            # Generate voice clone prompt
-            try:
-                prompt_items = model.create_voice_clone_prompt(
+
+            self.root.after(
+                0,
+                lambda: self.train_status_label.config(
+                    text="Creating voice clone prompt...", foreground="blue"
+                ),
+            )
+
+            def do_create_prompt(m):
+                return m.create_voice_clone_prompt(
                     ref_audio=ref_audio,
                     ref_text=ref_text,
                     x_vector_only_mode=False,
                 )
+
+            try:
+                prompt_items = do_create_prompt(model)
             except (RuntimeError, torch.cuda.CudaError) as cuda_error:
-                # Check if it's a CUDA compatibility error during operation
-                error_str = str(cuda_error).lower()
-                if "cuda" in error_str and ("kernel" in error_str or "no kernel image" in error_str or "device" in error_str):
-                    # CUDA error during operation - reload model on CPU and retry
-                    device_type = "cpu"  # Update device_type for fallback
-                    self.root.after(0, lambda: self.train_status_label.config(
-                        text="CUDA error during processing, retrying on CPU...", foreground="orange"))
-                    self.root.after(0, lambda: messagebox.showwarning(
-                        "CUDA Compatibility Issue",
-                        f"CUDA error during processing: {str(cuda_error)}\n\nReloading model on CPU and retrying. Training may be slower."))
-                    # Reload model with CPU config
-                    config = self.get_model_config("cpu", show_warning=False)
-                    model = Qwen3TTSModel.from_pretrained(
-                        MODEL_REPO_BASE,
-                        **config
-                    )
-                    # Retry the operation
-                    prompt_items = model.create_voice_clone_prompt(
-                        ref_audio=ref_audio,
-                        ref_text=ref_text,
-                        x_vector_only_mode=False,
-                    )
-                else:
-                    # Re-raise if it's not a CUDA compatibility error
+                if not _is_cuda_compat_error(cuda_error):
                     raise
-            
+                error_text = str(cuda_error)
+                self.root.after(
+                    0,
+                    lambda: self.train_status_label.config(
+                        text="CUDA error during processing, retrying on CPU...",
+                        foreground="orange",
+                    ),
+                )
+                self.root.after(
+                    0,
+                    lambda: messagebox.showwarning(
+                        "CUDA Compatibility Issue",
+                        f"CUDA error during processing: {error_text}\n\n"
+                        "Reloading model on CPU and retrying. Training may be slower.",
+                    ),
+                )
+                model, device_type = self._load_model(
+                    MODEL_REPO_BASE, "cpu", show_warning=False
+                )
+                prompt_items = do_create_prompt(model)
+
             # Voices always live in the local cache (OUTPUT_DIR) — that's what makes
             # the voice picker's cache scan work.
             output_file = os.path.join(OUTPUT_DIR, f"{voice_name}.pt")
-
-            # Save the prompt
             torch.save(prompt_items, output_file)
 
-            self.root.after(0, lambda: self.train_status_label.config(
-                text=f"Voice '{voice_name}' trained successfully! Saved to {output_file}",
-                foreground="green"))
-            self.root.after(0, lambda: self.show_success_with_link(
-                "Success", f"Voice '{voice_name}' has been trained and saved to:", output_file))
+            self.root.after(
+                0,
+                lambda: self.train_status_label.config(
+                    text=f"Voice '{voice_name}' trained successfully! Saved to {output_file}",
+                    foreground="green",
+                ),
+            )
+            self.root.after(
+                0,
+                lambda: self.show_success_with_link(
+                    "Success",
+                    f"Voice '{voice_name}' has been trained and saved to:",
+                    output_file,
+                ),
+            )
             self.root.after(0, self.refresh_voice_lists)
 
         except Exception as e:
-            error_msg = f"Error during training: {str(e)}"
-            self.root.after(0, lambda: self.train_status_label.config(
-                text=error_msg, foreground="red"))
+            error_msg = f"Error during training: {e}"
+            self.root.after(
+                0,
+                lambda: self.train_status_label.config(
+                    text=error_msg, foreground="red"
+                ),
+            )
             self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
         finally:
             self.root.after(0, lambda: self.set_train_busy(False))
 
     def generate_speech(self):
+        """Parse [VoiceName] markers, validate them, and kick off `_generate_speech_thread`."""
         text = self.get_text_value(self.text_entry)
         output_format = self.output_format.get()
         language = self.use_language_combo.get()
@@ -1043,13 +1252,16 @@ class QwenTTSGUI:
             messagebox.showerror("Error", "Please enter text to generate")
             return
 
-        segments, unresolved = parse_voice_segments(text, default_voice, build_voice_lookup())
+        segments, unresolved = parse_voice_segments(
+            text, default_voice, build_voice_lookup()
+        )
         if unresolved:
             names = ", ".join(f"[{name}]" for name in unresolved)
             messagebox.showerror(
                 "Unknown Voice",
                 f"Unknown voice(s) in the text: {names}\n\n"
-                "Check spelling against the Voice dropdown / your trained voices.")
+                "Check spelling against the Voice dropdown / your trained voices.",
+            )
             return
 
         if not segments:
@@ -1058,57 +1270,90 @@ class QwenTTSGUI:
 
         self.set_use_busy(True)
 
-        # Run generation in a separate thread
         thread = threading.Thread(
             target=self._generate_speech_thread,
-            args=(segments, output_format, language, instruct)
+            args=(segments, output_format, language, instruct),
         )
         thread.daemon = True
         thread.start()
 
     def _load_voice_clone_prompt(self, key, device_type):
-        """Load a custom voice's saved VoiceClonePromptItem from OUTPUT_DIR/{key}.pt
-        (train_voice always saves a single-item list, since ref_audio there is always
-        a single reference recording)."""
+        """Load a trained custom voice's VoiceClonePromptItem.
+
+        Args:
+            key: Voice name; read from OUTPUT_DIR/{key}.pt.
+            device_type: "cuda" or "cpu" — where the tensors should end up.
+
+        Returns:
+            The VoiceClonePromptItem (train_voice always saves a single-item list,
+            since ref_audio there is always a single reference recording).
+
+        Raises:
+            FileNotFoundError: If OUTPUT_DIR/{key}.pt doesn't exist.
+            Exception: If the file exists but can't be unpickled.
+        """
         voice_file = os.path.join(OUTPUT_DIR, f"{key}.pt")
         if not os.path.exists(voice_file):
             raise FileNotFoundError(f"Voice file not found: {voice_file}")
 
-        # Allowlist the class
+        # torch.load with weights_only (the safe default since PyTorch 2.6) needs
+        # VoiceClonePromptItem allowlisted, since it's not a builtin type.
         torch.serialization.add_safe_globals([VoiceClonePromptItem])
 
-        # Use map_location to handle CPU/GPU properly
-        map_location = "cpu" if device_type == "cpu" or not torch.cuda.is_available() else None
+        map_location = (
+            "cpu" if device_type == "cpu" or not torch.cuda.is_available() else None
+        )
 
         try:
-            # Try loading with weights_only parameter (PyTorch 2.0+)
             try:
                 if map_location:
-                    prompt_items = torch.load(voice_file, map_location=map_location, weights_only=False)
+                    prompt_items = torch.load(
+                        voice_file, map_location=map_location, weights_only=False
+                    )
                 else:
                     prompt_items = torch.load(voice_file, weights_only=False)
             except TypeError:
-                # Fallback for older PyTorch versions that don't support weights_only
+                # Older PyTorch versions don't accept weights_only at all.
                 if map_location:
                     prompt_items = torch.load(voice_file, map_location=map_location)
                 else:
                     prompt_items = torch.load(voice_file)
         except Exception:
-            # Try loading on CPU as final fallback
             try:
                 prompt_items = torch.load(voice_file, map_location="cpu")
             except Exception as e:
                 error_details = str(e)
-                if "pickle" in error_details.lower() or "unpickling" in error_details.lower():
-                    raise Exception(f"Failed to load voice file. The file may be corrupted or incompatible. Error: {error_details}")
+                if (
+                    "pickle" in error_details.lower()
+                    or "unpickling" in error_details.lower()
+                ):
+                    raise Exception(
+                        f"Failed to load voice file. The file may be corrupted or incompatible. Error: {error_details}"
+                    )
                 else:
-                    raise Exception(f"Failed to load voice file '{voice_file}': {error_details}")
+                    raise Exception(
+                        f"Failed to load voice file '{voice_file}': {error_details}"
+                    )
 
         return prompt_items[0]
 
-    def _generate_speech_thread(self, segments, output_format="wav", language="Auto", instruct=""):
+    def _generate_speech_thread(
+        self, segments, output_format="wav", language="Auto", instruct=""
+    ):
+        """Generate and stitch together speech for parsed [VoiceName] segments.
+
+        Groups segments by model kind ("custom" -> Base, "preset" -> CustomVoice),
+        loading each model at most once and generating its group's segments in a
+        single batched call, then reassembles the results in original text order.
+
+        Args:
+            segments: Ordered (kind, key, text) tuples from `parse_voice_segments`.
+            output_format: "wav", "mp3", or "m4a".
+            language: One of SUPPORTED_LANGUAGES, applied to every segment.
+            instruct: Style instruction, applied only to "preset" segments.
+        """
         try:
-            device_type = self.use_device_type.get()
+            device_type = self.device_type.get()
 
             groups = {}  # kind -> list of (segment_index, key, text)
             for i, (kind, key, seg_text) in enumerate(segments):
@@ -1123,7 +1368,9 @@ class QwenTTSGUI:
 
             for group_index, kind in enumerate(kinds_needed):
                 group = groups[kind]
-                model_repo = MODEL_REPO_CUSTOM_VOICE if kind == "preset" else MODEL_REPO_BASE
+                model_repo = (
+                    MODEL_REPO_CUSTOM_VOICE if kind == "preset" else MODEL_REPO_BASE
+                )
 
                 # Only worth naming the group/voices once there's more than one group —
                 # for the common single-voice case this stays exactly as it always was.
@@ -1134,18 +1381,25 @@ class QwenTTSGUI:
                 else:
                     phase = ""
 
-                self.root.after(0, lambda p=phase: self.use_status_label.config(
-                    text=f"Loading model{p}...", foreground="blue"))
+                self.root.after(
+                    0,
+                    lambda p=phase: self.use_status_label.config(
+                        text=f"Loading model{p}...", foreground="blue"
+                    ),
+                )
                 model, device_type = self._load_model(
-                    model_repo, device_type, show_warning=(group_index == 0),
-                    status_label=self.use_status_label)
+                    model_repo,
+                    device_type,
+                    show_warning=(group_index == 0),
+                    status_label=self.use_status_label,
+                )
 
                 texts = [t for _, _, t in group]
 
                 if kind == "preset":
                     speakers = [k for _, k, _ in group]
 
-                    def do_generate(m):
+                    def do_generate(m, texts=texts, speakers=speakers):
                         return m.generate_custom_voice(
                             text=texts,
                             speaker=speakers,
@@ -1153,55 +1407,88 @@ class QwenTTSGUI:
                             instruct=instruct or None,
                         )
                 else:
-                    self.root.after(0, lambda p=phase: self.use_status_label.config(
-                        text=f"Loading voice(s){p}...", foreground="blue"))
+                    self.root.after(
+                        0,
+                        lambda p=phase: self.use_status_label.config(
+                            text=f"Loading voice(s){p}...", foreground="blue"
+                        ),
+                    )
                     for _, key, _ in group:
                         if key not in loaded_prompts:
-                            loaded_prompts[key] = self._load_voice_clone_prompt(key, device_type)
+                            loaded_prompts[key] = self._load_voice_clone_prompt(
+                                key, device_type
+                            )
                     prompts = [loaded_prompts[k] for _, k, _ in group]
 
-                    def do_generate(m):
+                    def do_generate(m, texts=texts, prompts=prompts):
                         return m.generate_voice_clone(
                             text=texts,
                             language=language,
                             voice_clone_prompt=prompts,
                         )
 
-                self.root.after(0, lambda p=phase: self.use_status_label.config(
-                    text=f"Generating speech{p}...", foreground="blue"))
+                self.root.after(
+                    0,
+                    lambda p=phase: self.use_status_label.config(
+                        text=f"Generating speech{p}...", foreground="blue"
+                    ),
+                )
 
                 try:
                     group_wavs, group_sr = do_generate(model)
                 except (RuntimeError, torch.cuda.CudaError) as cuda_error:
                     if not _is_cuda_compat_error(cuda_error):
                         raise
-                    self.root.after(0, lambda: self.use_status_label.config(
-                        text="CUDA error during generation, retrying on CPU...", foreground="orange"))
-                    self.root.after(0, lambda: messagebox.showwarning(
-                        "CUDA Compatibility Issue",
-                        f"CUDA error during generation: {cuda_error}\n\n"
-                        "Reloading model on CPU and retrying. Generation may be slower."))
-                    model, device_type = self._load_model(model_repo, "cpu", show_warning=False)
+                    error_text = str(cuda_error)
+                    self.root.after(
+                        0,
+                        lambda: self.use_status_label.config(
+                            text="CUDA error during generation, retrying on CPU...",
+                            foreground="orange",
+                        ),
+                    )
+                    self.root.after(
+                        0,
+                        lambda error_text=error_text: messagebox.showwarning(
+                            "CUDA Compatibility Issue",
+                            f"CUDA error during generation: {error_text}\n\n"
+                            "Reloading model on CPU and retrying. Generation may be slower.",
+                        ),
+                    )
+                    model, device_type = self._load_model(
+                        model_repo, "cpu", show_warning=False
+                    )
                     if kind == "custom":
-                        # Prompts loaded above may be pinned to the failed device — reload on CPU.
+                        # Prompts loaded above may be pinned to the failed device — reload on
+                        # CPU and pass explicitly, since do_generate's default was bound to
+                        # the now-stale list.
                         for _, key, _ in group:
-                            loaded_prompts[key] = self._load_voice_clone_prompt(key, "cpu")
+                            loaded_prompts[key] = self._load_voice_clone_prompt(
+                                key, "cpu"
+                            )
                         prompts = [loaded_prompts[k] for _, k, _ in group]
-                    group_wavs, group_sr = do_generate(model)
+                        group_wavs, group_sr = do_generate(model, prompts=prompts)
+                    else:
+                        group_wavs, group_sr = do_generate(model)
 
                 if sr is None:
                     sr = group_sr
                 elif sr != group_sr:
                     raise RuntimeError(
                         f"Sample rate mismatch between voice groups ({sr} vs {group_sr}) — "
-                        "can't stitch this generation together.")
+                        "can't stitch this generation together."
+                    )
 
                 for (i, _, _), wav in zip(group, group_wavs):
                     wavs_by_index[i] = wav
 
             if len(segments) > 1:
-                self.root.after(0, lambda: self.use_status_label.config(
-                    text="Stitching audio...", foreground="blue"))
+                self.root.after(
+                    0,
+                    lambda: self.use_status_label.config(
+                        text="Stitching audio...", foreground="blue"
+                    ),
+                )
 
             # Reassemble in original text order, with a short silence gap at each
             # voice change so the splice doesn't sound abrupt.
@@ -1227,31 +1514,45 @@ class QwenTTSGUI:
                 filename_stub = "multivoice_output"
 
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            output_file = os.path.join(output_dir, f"{filename_stub}_{timestamp}.{output_format}")
+            output_file = os.path.join(
+                output_dir, f"{filename_stub}_{timestamp}.{output_format}"
+            )
 
             if output_format == "wav":
                 sf.write(output_file, final_wav, sr)
             else:
                 encode_audio(final_wav, sr, output_file, output_format)
 
-            self.root.after(0, lambda: self.use_status_label.config(
-                text=f"Speech generated successfully! Saved to {output_file}",
-                foreground="green"))
-            self.root.after(0, lambda: self.show_success_with_link(
-                "Success", "Speech has been generated and saved to:", output_file))
+            self.root.after(
+                0,
+                lambda: self.use_status_label.config(
+                    text=f"Speech generated successfully! Saved to {output_file}",
+                    foreground="green",
+                ),
+            )
+            self.root.after(
+                0,
+                lambda: self.show_success_with_link(
+                    "Success", "Speech has been generated and saved to:", output_file
+                ),
+            )
 
         except Exception as e:
-            error_msg = f"Error during generation: {str(e)}"
-            self.root.after(0, lambda: self.use_status_label.config(
-                text=error_msg, foreground="red"))
+            error_msg = f"Error during generation: {e}"
+            self.root.after(
+                0,
+                lambda: self.use_status_label.config(text=error_msg, foreground="red"),
+            )
             self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
         finally:
             self.root.after(0, lambda: self.set_use_busy(False))
 
+
 def main():
     root = tk.Tk()
-    app = QwenTTSGUI(root)
+    QwenTTSGUI(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
