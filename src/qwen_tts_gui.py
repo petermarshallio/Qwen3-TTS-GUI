@@ -129,7 +129,77 @@ class QwenTTSGUI:
         self.use_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.use_frame, text="Use Voice")
         self.setup_use_tab()
-        
+
+    # --- Placeholder text + live counters, shared by the Transcript / Text to
+    # Generate / Instruction boxes ---
+
+    def add_placeholder_text(self, widget, placeholder):
+        """Grey hint text for a ScrolledText widget; cleared on focus, restored when empty."""
+        widget.showing_placeholder = True
+        widget.insert("1.0", placeholder)
+        widget.config(foreground="grey")
+
+        def on_focus_in(event):
+            if widget.showing_placeholder:
+                widget.delete("1.0", tk.END)
+                widget.config(foreground="black")
+                widget.showing_placeholder = False
+
+        def on_focus_out(event):
+            if not widget.get("1.0", "end-1c").strip():
+                widget.insert("1.0", placeholder)
+                widget.config(foreground="grey")
+                widget.showing_placeholder = True
+
+        widget.bind("<FocusIn>", on_focus_in, add="+")
+        widget.bind("<FocusOut>", on_focus_out, add="+")
+
+    def add_placeholder_entry(self, widget, placeholder):
+        """Grey hint text for a single-line Entry widget."""
+        widget.showing_placeholder = True
+        widget.insert(0, placeholder)
+        widget.config(foreground="grey")
+
+        def on_focus_in(event):
+            if widget.showing_placeholder:
+                widget.delete(0, tk.END)
+                widget.config(foreground="black")
+                widget.showing_placeholder = False
+
+        def on_focus_out(event):
+            if not widget.get().strip():
+                widget.insert(0, placeholder)
+                widget.config(foreground="grey")
+                widget.showing_placeholder = True
+
+        widget.bind("<FocusIn>", on_focus_in, add="+")
+        widget.bind("<FocusOut>", on_focus_out, add="+")
+
+    def get_text_value(self, widget):
+        """Content of a placeholder-aware ScrolledText widget, empty while the placeholder shows."""
+        if getattr(widget, "showing_placeholder", False):
+            return ""
+        return widget.get("1.0", tk.END).strip()
+
+    def get_entry_value(self, widget):
+        """Content of a placeholder-aware Entry widget, empty while the placeholder shows."""
+        if getattr(widget, "showing_placeholder", False):
+            return ""
+        return widget.get().strip()
+
+    def bind_text_counter(self, widget, label):
+        """Keep `label` showing a live character/word count for `widget` (placeholder-aware)."""
+        def update(event=None):
+            content = self.get_text_value(widget)
+            words = len(content.split()) if content else 0
+            label.config(text=f"{len(content)} characters, {words} words")
+
+        widget.bind("<KeyRelease>", update, add="+")
+        widget.bind("<<Paste>>", lambda e: widget.after(1, update), add="+")
+        widget.bind("<FocusIn>", lambda e: widget.after(1, update), add="+")
+        widget.bind("<FocusOut>", lambda e: widget.after(1, update), add="+")
+        update()
+
     def setup_train_tab(self):
         # Title
         title_label = ttk.Label(self.train_frame, text="Train a New Voice", font=("Arial", 16, "bold"))
@@ -184,8 +254,12 @@ class QwenTTSGUI:
         transcript_frame = ttk.Frame(self.file_frame)
         transcript_frame.pack(fill=tk.X, pady=5)
         ttk.Label(transcript_frame, text="Transcript:").pack(anchor=tk.W, padx=5)
-        self.transcript_entry = scrolledtext.ScrolledText(transcript_frame, height=4, width=50)
+        self.transcript_entry = scrolledtext.ScrolledText(transcript_frame, height=4, width=50, wrap=tk.WORD)
         self.transcript_entry.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.add_placeholder_text(self.transcript_entry, "Enter the exact transcript of the reference audio...")
+        self.transcript_counter_label = ttk.Label(transcript_frame, text="", foreground="gray")
+        self.transcript_counter_label.pack(anchor=tk.E, padx=5)
+        self.bind_text_counter(self.transcript_entry, self.transcript_counter_label)
 
         # Recording section (shown only for the "record" method)
         self.record_frame = ttk.LabelFrame(self.train_frame, text="Recording", padding=10)
@@ -279,6 +353,7 @@ class QwenTTSGUI:
         ttk.Label(self.instruct_frame, text="Instruction:").pack(side=tk.LEFT, padx=5)
         self.instruct_entry = ttk.Entry(self.instruct_frame, width=37)
         self.instruct_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        self.add_placeholder_entry(self.instruct_entry, "e.g. say it in an angry tone")
 
         # Device selection
         device_frame = ttk.LabelFrame(self.use_frame, text="Device Selection", padding=10)
@@ -294,8 +369,12 @@ class QwenTTSGUI:
         text_frame = ttk.LabelFrame(self.use_frame, text="Text to Generate", padding=10)
         text_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
         
-        self.text_entry = scrolledtext.ScrolledText(text_frame, height=8, width=50)
+        self.text_entry = scrolledtext.ScrolledText(text_frame, height=8, width=50, wrap=tk.WORD)
         self.text_entry.pack(fill=tk.BOTH, expand=True)
+        self.add_placeholder_text(self.text_entry, "Enter text to synthesize...")
+        self.text_counter_label = ttk.Label(text_frame, text="", foreground="gray")
+        self.text_counter_label.pack(anchor=tk.E)
+        self.bind_text_counter(self.text_entry, self.text_counter_label)
 
         # Output format selection
         format_frame = ttk.LabelFrame(self.use_frame, text="Output Format", padding=10)
@@ -517,7 +596,7 @@ class QwenTTSGUI:
             
             if method == "file":
                 audio_file = self.audio_file_entry.get().strip()
-                ref_text = self.transcript_entry.get("1.0", tk.END).strip()
+                ref_text = self.get_text_value(self.transcript_entry)
                 
                 if not audio_file:
                     self.root.after(0, lambda: messagebox.showerror("Error", "Please select an audio file"))
@@ -600,10 +679,10 @@ class QwenTTSGUI:
             self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
     
     def generate_speech(self):
-        text = self.text_entry.get("1.0", tk.END).strip()
+        text = self.get_text_value(self.text_entry)
         output_format = self.output_format.get()
         language = self.use_language_combo.get()
-        instruct = self.instruct_entry.get().strip()
+        instruct = self.get_entry_value(self.instruct_entry)
 
         selected = self.use_voice_combo.get()
         voice = self.use_voice_map.get(selected)
