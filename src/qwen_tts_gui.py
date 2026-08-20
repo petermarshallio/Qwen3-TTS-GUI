@@ -4,13 +4,12 @@ import torch
 import sounddevice as sd
 import soundfile as sf
 import numpy as np
+import av
 from qwen_tts import Qwen3TTSModel
 from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
 import threading
 import os
 import sys
-import shutil
-import subprocess
 
 # Fix CUDA detection in PyInstaller bundles
 # PyInstaller sometimes doesn't properly detect CUDA libraries
@@ -52,6 +51,36 @@ else:
 OUTPUT_DIR = os.path.join(_base_dir, "local")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 MIC_RECORDING_PATH = os.path.join(OUTPUT_DIR, "mic.wav")
+
+
+def encode_audio(samples, sr, output_file, output_format):
+    """Encode a float32 numpy array to mp3/m4a via PyAV (bundles its own
+    encoders, no system ffmpeg needed). samples is (n,) mono or (n, channels)."""
+    if samples.ndim == 1:
+        data = samples.reshape(1, -1)
+        layout = "mono"
+    else:
+        data = samples.T
+        layout = "stereo" if data.shape[0] == 2 else "mono"
+
+    container_format = "mp3" if output_format == "mp3" else "mp4"
+    codec_name = "libmp3lame" if output_format == "mp3" else "aac"
+
+    container = av.open(output_file, mode="w", format=container_format)
+    stream = container.add_stream(codec_name, rate=sr)
+    stream.layout = layout
+    stream.bit_rate = 192000
+
+    frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(data.astype(np.float32)), format="fltp", layout=layout)
+    frame.sample_rate = sr
+
+    for packet in stream.encode(frame):
+        container.mux(packet)
+    for packet in stream.encode(None):
+        container.mux(packet)
+
+    container.close()
+
 
 class QwenTTSGUI:
     def __init__(self, root):
@@ -501,12 +530,6 @@ class QwenTTSGUI:
             messagebox.showerror("Error", f"Voice file not found: {voice_file}")
             return
 
-        if output_format != "wav" and shutil.which("ffmpeg") is None:
-            messagebox.showerror("Error",
-                f"ffmpeg is required to export {output_format.upper()} but was not found on PATH.\n\n"
-                "Install it (e.g. brew install ffmpeg / apt install ffmpeg) or choose WAV instead.")
-            return
-
         # Run generation in a separate thread
         thread = threading.Thread(target=self._generate_speech_thread, args=(voice_file, text, output_format))
         thread.daemon = True
@@ -638,22 +661,7 @@ class QwenTTSGUI:
             if output_format == "wav":
                 sf.write(output_file, wavs[0], sr)
             else:
-                # soundfile can't encode mp3/m4a, so write a wav first and hand it to
-                # ffmpeg for the actual encode. generate_speech() already checked
-                # ffmpeg is on PATH before this thread was started.
-                tmp_wav = os.path.join(output_dir, f"{voice_name}_output.tmp.wav")
-                sf.write(tmp_wav, wavs[0], sr)
-                try:
-                    codec = "libmp3lame" if output_format == "mp3" else "aac"
-                    result = subprocess.run(
-                        ["ffmpeg", "-y", "-i", tmp_wav, "-c:a", codec, "-b:a", "192k", output_file],
-                        capture_output=True, text=True
-                    )
-                    if result.returncode != 0:
-                        raise RuntimeError(f"ffmpeg failed to export {output_format.upper()}: {result.stderr}")
-                finally:
-                    if os.path.exists(tmp_wav):
-                        os.remove(tmp_wav)
+                encode_audio(wavs[0], sr, output_file, output_format)
             
             self.root.after(0, lambda: self.use_status_label.config(
                 text=f"Speech generated successfully! Saved to {output_file}", 
