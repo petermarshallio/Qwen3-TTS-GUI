@@ -93,14 +93,14 @@ reusable via `[VoiceName]` markers just like a recorded one, with no separate
 
 ## Generation / sampling controls
 
-- [ ] Expose as a collapsed "Advanced" section at the bottom of the Use Voice tab,
-      defaults matching the library's own hard defaults exactly (untouched unless the
-      user opens it and changes something):
-  - [ ] `temperature`
-  - [ ] `top_k` / `top_p`
-  - [ ] `repetition_penalty`
-  - [ ] `max_new_tokens`
-  - [ ] `subtalker_*` variants — confirmed relevant: `core/tokenizer_12hz/` is
+- [x] Exposed as a collapsed "Advanced" section at the bottom of the Use Voice tab
+      (`CollapsibleSection`), defaults matching the library's own hard defaults
+      exactly (untouched unless the user opens it and changes something):
+  - [x] `temperature`
+  - [x] `top_k` / `top_p`
+  - [x] `repetition_penalty`
+  - [x] `max_new_tokens`
+  - [x] `subtalker_*` variants — confirmed relevant: `core/tokenizer_12hz/` is
         literally the "tokenizer v2" implementation (`model_type =
         "qwen3_tts_tokenizer_12hz"`), and every model this app uses is a 12Hz
         checkpoint, so these aren't dead parameters for any model here
