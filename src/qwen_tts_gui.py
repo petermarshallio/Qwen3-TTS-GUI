@@ -125,6 +125,7 @@ class QwenTTSGUI:
         save_frame.pack(fill=tk.X, padx=20, pady=10)
         ttk.Label(save_frame, text="Save Location:").pack(side=tk.LEFT, padx=5)
         self.train_save_entry = ttk.Entry(save_frame, width=30)
+        self.train_save_entry.insert(0, OUTPUT_DIR)
         self.train_save_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         ttk.Button(save_frame, text="Browse", command=self.browse_save_location_train).pack(side=tk.LEFT, padx=5)
         
@@ -142,43 +143,43 @@ class QwenTTSGUI:
         method_frame.pack(fill=tk.X, padx=20, pady=10)
         
         self.train_method = tk.StringVar(value="file")
-        ttk.Radiobutton(method_frame, text="From Audio File + Transcript", 
-                       variable=self.train_method, value="file").pack(anchor=tk.W, pady=5)
-        ttk.Radiobutton(method_frame, text="Record Audio (Pre-made Script)", 
-                       variable=self.train_method, value="record").pack(anchor=tk.W, pady=5)
-        
-        # File input section
-        file_frame = ttk.LabelFrame(self.train_frame, text="File Input", padding=10)
-        file_frame.pack(fill=tk.X, padx=20, pady=10)
-        
-        audio_file_frame = ttk.Frame(file_frame)
+        ttk.Radiobutton(method_frame, text="From Audio File + Transcript",
+                       variable=self.train_method, value="file",
+                       command=self.update_train_method_visibility).pack(anchor=tk.W, pady=5)
+        ttk.Radiobutton(method_frame, text="Record Audio (Pre-made Script)",
+                       variable=self.train_method, value="record",
+                       command=self.update_train_method_visibility).pack(anchor=tk.W, pady=5)
+
+        # File input section (shown only for the "file" method)
+        self.file_frame = ttk.LabelFrame(self.train_frame, text="File Input", padding=10)
+
+        audio_file_frame = ttk.Frame(self.file_frame)
         audio_file_frame.pack(fill=tk.X, pady=5)
         ttk.Label(audio_file_frame, text="Audio File:").pack(side=tk.LEFT, padx=5)
         self.audio_file_entry = ttk.Entry(audio_file_frame, width=40)
         self.audio_file_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         ttk.Button(audio_file_frame, text="Browse", command=self.browse_audio_file).pack(side=tk.LEFT, padx=5)
         
-        transcript_frame = ttk.Frame(file_frame)
+        transcript_frame = ttk.Frame(self.file_frame)
         transcript_frame.pack(fill=tk.X, pady=5)
         ttk.Label(transcript_frame, text="Transcript:").pack(anchor=tk.W, padx=5)
         self.transcript_entry = scrolledtext.ScrolledText(transcript_frame, height=4, width=50)
         self.transcript_entry.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Recording section
-        record_frame = ttk.LabelFrame(self.train_frame, text="Recording", padding=10)
-        record_frame.pack(fill=tk.X, padx=20, pady=10)
-        
+
+        # Recording section (shown only for the "record" method)
+        self.record_frame = ttk.LabelFrame(self.train_frame, text="Recording", padding=10)
+
         self.script_text = "On a warm Saturday morning, the quick brown fox jumped over several lazy dogs while distant musicians played jazzy tunes near the quiet park. People checked their phones, argued about numbers, dates, and prices, and casually mentioned names like Alex, Jordan, and Taylor. A cyclist shouted warnings, a train horn echoed, and someone asked, ‘Why does this even matter?’ as rain began falling lightly at exactly 9:47 a.m., changing plans, moods, and expectations all at once."
-        ttk.Label(record_frame, text="Script to read:", font=("Arial", 10, "bold")).pack(anchor=tk.W, pady=5)
-        script_display = scrolledtext.ScrolledText(record_frame, height=7, width=50, wrap=tk.WORD)
+        ttk.Label(self.record_frame, text="Script to read:", font=("Arial", 10, "bold")).pack(anchor=tk.W, pady=5)
+        script_display = scrolledtext.ScrolledText(self.record_frame, height=7, width=50, wrap=tk.WORD)
         script_display.insert("1.0", self.script_text)
         script_display.config(state=tk.DISABLED)
         script_display.pack(fill=tk.X, pady=5)
-        
-        self.record_status_label = ttk.Label(record_frame, text="Ready to record", foreground="green")
+
+        self.record_status_label = ttk.Label(self.record_frame, text="Ready to record", foreground="green")
         self.record_status_label.pack(pady=5)
-        
-        self.record_button = ttk.Button(record_frame, text="Start Recording", command=self.toggle_recording)
+
+        self.record_button = ttk.Button(self.record_frame, text="Start Recording", command=self.toggle_recording)
         self.record_button.pack(pady=5)
         
         # Status and progress
@@ -186,10 +187,21 @@ class QwenTTSGUI:
         self.train_status_label.pack(pady=10)
         
         # Train button
-        train_button = ttk.Button(self.train_frame, text="Train Voice", command=self.train_voice, 
+        train_button = ttk.Button(self.train_frame, text="Train Voice", command=self.train_voice,
                                  style="Accent.TButton")
         train_button.pack(pady=20)
-        
+
+        self.update_train_method_visibility()
+
+    def update_train_method_visibility(self):
+        """Show only the File Input or Recording section, matching the selected training method."""
+        if self.train_method.get() == "file":
+            self.record_frame.pack_forget()
+            self.file_frame.pack(fill=tk.X, padx=20, pady=10, before=self.train_status_label)
+        else:
+            self.file_frame.pack_forget()
+            self.record_frame.pack(fill=tk.X, padx=20, pady=10, before=self.train_status_label)
+
     def setup_use_tab(self):
         # Title
         title_label = ttk.Label(self.use_frame, text="Generate Speech from a pretrained Voice", font=("Arial", 16, "bold"))
@@ -240,6 +252,7 @@ class QwenTTSGUI:
         save_frame.pack(fill=tk.X, padx=20, pady=10)
         ttk.Label(save_frame, text="Save Location:").pack(side=tk.LEFT, padx=5)
         self.use_save_entry = ttk.Entry(save_frame, width=40)
+        self.use_save_entry.insert(0, OUTPUT_DIR)
         self.use_save_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         ttk.Button(save_frame, text="Browse", command=self.browse_save_location_use).pack(side=tk.LEFT, padx=5)
         
