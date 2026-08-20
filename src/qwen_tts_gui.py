@@ -1190,6 +1190,11 @@ class QwenTTSGUI:
                 foreground="gray",
             ).pack(side=tk.LEFT, padx=10)
 
+        # (dtype_frame, dtype_var) pairs — CPU always forces float32 in
+        # get_model_config regardless of the dtype setting, so when Device is CPU,
+        # the dtype choice is disabled (not just documented) rather than left
+        # selectable-but-inert.
+        self._dtype_controls = []
         self._setup_model_settings_section(
             self.configure_frame, "Train", self.train_model_size, self.train_dtype
         )
@@ -1198,6 +1203,10 @@ class QwenTTSGUI:
             "Generate",
             self.generate_model_size,
             self.generate_dtype,
+        )
+        self._update_dtype_availability()
+        self.device_type.trace_add(
+            "write", lambda *_args: self._update_dtype_availability()
         )
 
     def _setup_model_settings_section(self, parent, title, model_size_var, dtype_var):
@@ -1225,6 +1234,16 @@ class QwenTTSGUI:
             text="dtype only applies when running on CUDA — CPU always uses float32.",
             foreground="gray",
         ).pack(anchor=tk.W, pady=(5, 0))
+        self._dtype_controls.append((dtype_frame, dtype_var))
+
+    def _update_dtype_availability(self):
+        """Enable dtype radios only on CUDA; force float32 on CPU so the displayed
+        value always matches what get_model_config will actually use."""
+        cuda_selected = self.device_type.get() == "cuda"
+        for dtype_frame, dtype_var in self._dtype_controls:
+            self._set_frame_enabled(dtype_frame, cuda_selected)
+            if not cuda_selected:
+                dtype_var.set("float32")
 
     def browse_audio_file(self):
         filename = filedialog.askopenfilename(
