@@ -82,13 +82,17 @@ before the user has done anything. The 9 names are fixed for this released check
 
 ## Generation / sampling controls
 
-- [ ] Expose (likely as an "Advanced" collapsible section, defaults untouched):
+- [ ] Expose as a collapsed "Advanced" section at the bottom of the Use Voice tab,
+      defaults matching the library's own hard defaults exactly (untouched unless the
+      user opens it and changes something):
   - [ ] `temperature`
   - [ ] `top_k` / `top_p`
   - [ ] `repetition_penalty`
   - [ ] `max_new_tokens`
-  - [ ] `subtalker_*` variants (tokenizer-v2-specific — check whether relevant model
-        checkpoints actually use tokenizer v2 before bothering)
+  - [ ] `subtalker_*` variants — confirmed relevant: `core/tokenizer_12hz/` is
+        literally the "tokenizer v2" implementation (`model_type =
+        "qwen3_tts_tokenizer_12hz"`), and every model this app uses is a 12Hz
+        checkpoint, so these aren't dead parameters for any model here
 
 ## Model size (Configure tab)
 
@@ -105,11 +109,6 @@ before the user has done anything. The 9 names are fixed for this released check
       CUDA — CPU always forces `float32` regardless of the setting, since
       float16/bfloat16 support on CPU-only torch builds is inconsistent
 
-## Batch generation
-
-- [ ] Consider a "generate multiple lines at once" mode — the underlying API already
-      accepts lists for `text`/`ref_audio`/`language`/etc. on all three generate methods
-
 ## Reference audio input flexibility (low priority)
 
 - [ ] `ref_audio` also accepts a URL or base64 string, not just a local file path —
@@ -120,3 +119,7 @@ before the user has done anything. The 9 names are fixed for this released check
 - `non_streaming_mode`: despite the name, the library's own docstring says this only
   simulates streaming text input internally; it is not real-time audio streaming.
   No user-facing capability is being missed here.
+- Batch generation ("generate multiple lines at once" via the API's list inputs for
+  `text`/`ref_audio`/`language`): dropped. Multi-voice `[VoiceName]` generation
+  already batches same-kind segments into a single call under the hood — a separate
+  user-facing "batch mode" wasn't asked for beyond that.

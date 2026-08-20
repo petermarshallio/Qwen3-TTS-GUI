@@ -409,6 +409,34 @@ class ProgressPanel:
         self._timer_id = self.frame.after(1000, self._tick)
 
 
+class CollapsibleSection:
+    """A clickable "▸ Title" header that shows/hides a body frame — Tkinter has no
+    built-in disclosure widget. Collapsed by default; the body is only packed once
+    expanded, so it takes no space until opened."""
+
+    def __init__(self, parent, title):
+        self._title = title
+        self.expanded = False
+        self.header = ttk.Frame(parent)
+        self.toggle_label = ttk.Label(
+            self.header, text=f"▸ {title}", foreground="#2b6cb0", cursor="hand2"
+        )
+        self.toggle_label.pack(anchor=tk.W)
+        self.toggle_label.bind("<Button-1>", lambda e: self.toggle())
+        self.body = ttk.Frame(parent)
+
+    def toggle(self):
+        self.expanded = not self.expanded
+        self.toggle_label.config(text=f"{'▾' if self.expanded else '▸'} {self._title}")
+        if self.expanded:
+            self.body.pack(fill=tk.X, pady=(5, 0), after=self.header)
+        else:
+            self.body.pack_forget()
+
+    def pack(self, **kwargs):
+        self.header.pack(**kwargs)
+
+
 class QwenTTSGUI:
     def __init__(self, root):
         self.root = root
@@ -1040,6 +1068,90 @@ class QwenTTSGUI:
         )
         self.cancel_button.pack(side=tk.LEFT)
 
+        self._setup_advanced_generation_section()
+
+    def _setup_advanced_generation_section(self):
+        """Collapsed by default; values default to the library's own hard defaults
+        (qwen_tts's `_merge_generate_kwargs`), so leaving this closed generates
+        identically to before it existed. subtalker_* variants are confirmed relevant
+        for every model this app uses — see TODO.md's "Generation / sampling controls"
+        entry."""
+        # Defaults mirror qwen_tts.inference.qwen3_tts_model._merge_generate_kwargs's
+        # hard_defaults exactly.
+        self.adv_temperature = tk.DoubleVar(value=0.9)
+        self.adv_top_k = tk.IntVar(value=50)
+        self.adv_top_p = tk.DoubleVar(value=1.0)
+        self.adv_repetition_penalty = tk.DoubleVar(value=1.05)
+        self.adv_max_new_tokens = tk.IntVar(value=2048)
+        self.adv_subtalker_dosample = tk.BooleanVar(value=True)
+        self.adv_subtalker_top_k = tk.IntVar(value=50)
+        self.adv_subtalker_top_p = tk.DoubleVar(value=1.0)
+        self.adv_subtalker_temperature = tk.DoubleVar(value=0.9)
+
+        section = CollapsibleSection(self.use_frame, "Advanced (sampling controls)")
+        section.pack(fill=tk.X, padx=20, pady=(0, 10))
+        body = section.body
+
+        self._add_spinbox_row(
+            body, "Temperature:", self.adv_temperature, 0.1, 2.0, 0.05
+        )
+        self._add_spinbox_row(body, "Top-k:", self.adv_top_k, 0, 200, 1)
+        self._add_spinbox_row(body, "Top-p:", self.adv_top_p, 0.0, 1.0, 0.05)
+        self._add_spinbox_row(
+            body, "Repetition penalty:", self.adv_repetition_penalty, 1.0, 2.0, 0.05
+        )
+        self._add_spinbox_row(
+            body, "Max new tokens:", self.adv_max_new_tokens, 256, 8192, 256
+        )
+
+        ttk.Separator(body, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
+        ttk.Label(
+            body, text="Sub-talker (12Hz tokenizer):", font=("Arial", 9, "bold")
+        ).pack(anchor=tk.W)
+        ttk.Checkbutton(
+            body,
+            text="Sub-talker sampling enabled",
+            variable=self.adv_subtalker_dosample,
+        ).pack(anchor=tk.W, pady=2)
+        self._add_spinbox_row(
+            body, "Sub-talker top-k:", self.adv_subtalker_top_k, 0, 200, 1
+        )
+        self._add_spinbox_row(
+            body, "Sub-talker top-p:", self.adv_subtalker_top_p, 0.0, 1.0, 0.05
+        )
+        self._add_spinbox_row(
+            body,
+            "Sub-talker temperature:",
+            self.adv_subtalker_temperature,
+            0.1,
+            2.0,
+            0.05,
+        )
+
+    def _add_spinbox_row(self, parent, label, var, from_, to, increment):
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=2)
+        ttk.Label(row, text=label, width=22, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Spinbox(
+            row, textvariable=var, from_=from_, to=to, increment=increment, width=10
+        ).pack(side=tk.LEFT)
+
+    def advanced_generation_kwargs(self):
+        """Current Advanced-section values, forwarded as **kwargs to
+        generate_custom_voice/generate_voice_clone (both pass unrecognized kwargs
+        through to the model's own generate())."""
+        return {
+            "temperature": self.adv_temperature.get(),
+            "top_k": self.adv_top_k.get(),
+            "top_p": self.adv_top_p.get(),
+            "repetition_penalty": self.adv_repetition_penalty.get(),
+            "max_new_tokens": self.adv_max_new_tokens.get(),
+            "subtalker_dosample": self.adv_subtalker_dosample.get(),
+            "subtalker_top_k": self.adv_subtalker_top_k.get(),
+            "subtalker_top_p": self.adv_subtalker_top_p.get(),
+            "subtalker_temperature": self.adv_subtalker_temperature.get(),
+        }
+
     def setup_configure_tab(self):
         """Settings you'd set once for this machine, rather than per-run choices
         repeated on every tab: a Global section (just Device — a fact about the
@@ -1662,6 +1774,7 @@ class QwenTTSGUI:
         step = 0
         try:
             device_type = self.device_type.get()
+            advanced_kwargs = self.advanced_generation_kwargs()
 
             groups, kinds_needed = group_segments_by_kind(segments)
 
@@ -1715,13 +1828,18 @@ class QwenTTSGUI:
                     instructs = [instr for _, _, _, instr in group]
 
                     def do_generate(
-                        m, texts=texts, speakers=speakers, instructs=instructs
+                        m,
+                        texts=texts,
+                        speakers=speakers,
+                        instructs=instructs,
+                        adv=advanced_kwargs,
                     ):
                         return m.generate_custom_voice(
                             text=texts,
                             speaker=speakers,
                             language=language,
                             instruct=instructs,
+                            **adv,
                         )
                 else:
                     self.root.after(
@@ -1737,11 +1855,14 @@ class QwenTTSGUI:
                             )
                     prompts = [loaded_prompts[k] for _, k, _, _ in group]
 
-                    def do_generate(m, texts=texts, prompts=prompts):
+                    def do_generate(
+                        m, texts=texts, prompts=prompts, adv=advanced_kwargs
+                    ):
                         return m.generate_voice_clone(
                             text=texts,
                             language=language,
                             voice_clone_prompt=prompts,
+                            **adv,
                         )
 
                 self.root.after(
